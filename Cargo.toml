@@ -1,0 +1,19 @@
+[workspace]
+members = ["smartguard-crypto", "smartguard"]
+resolver = "2"
+
+[workspace.dependencies]
+rustyguard-crypto = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-core = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-types = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-utils = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-tun = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+
+# Smartcard
+openpgp-card = "0.6.1"
+card-backend-pcsc = "0.5"
+
+# Utilities
+subtle = "2.6"
+secrecy = "0.10"
+thiserror = "2"
