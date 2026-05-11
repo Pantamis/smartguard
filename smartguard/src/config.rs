@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -18,9 +18,17 @@ pub struct Config {
 pub struct Interface {
     pub private_key: PrivateKeyConfig,
     pub listen_port: Option<u16>,
-    pub address: Option<String>,
+    /// Tunnel-local address(es) in CIDR form. Accepts either a single string
+    /// (`address = "10.0.0.1/24"`, kept for backward compatibility) or an
+    /// array (`address = ["10.0.0.1/24", "fd00::1/64"]`) for dual-stack.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub address: Vec<String>,
     #[serde(alias = "MTU")]
     pub mtu: Option<i32>,
+    /// DNS servers to install as the system resolver while the tunnel is up
+    /// (mirrors wg-quick's `DNS = ...`). Empty / unset = no change.
+    #[serde(default, alias = "DNS")]
+    pub dns: Vec<IpAddr>,
     #[serde(default)]
     pub smartcard: SmartcardSettings,
 }
@@ -121,6 +129,33 @@ pub struct Peer {
     pub allowed_ips: Vec<String>,
     /// Send keepalive every N seconds (0 = disabled).
     pub persistent_keepalive: Option<u16>,
+}
+
+/// Accept either a single string or an array of strings — same shape
+/// wg-quick parses for `Address = a, b` and what we want for both legacy
+/// configs (single address) and dual-stack configs (array).
+fn deserialize_string_or_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(vec![v])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 fn deserialize_key_base64<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
@@ -317,6 +352,54 @@ allowed_ips = ["10.0.0.2/32"]
 "#;
         let config = Config::from_str(toml).unwrap();
         assert!(config.peers[0].preshared_key.is_some());
+    }
+
+    #[test]
+    fn parse_address_single_string_legacy() {
+        let toml = r#"
+[interface]
+private_key = { smartcard = "auto" }
+address = "10.0.0.1/24"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.interface.address, vec!["10.0.0.1/24"]);
+    }
+
+    #[test]
+    fn parse_address_dual_stack() {
+        let toml = r#"
+[interface]
+private_key = { smartcard = "auto" }
+address = ["10.0.0.1/24", "fd00::1/64"]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(
+            config.interface.address,
+            vec!["10.0.0.1/24", "fd00::1/64"]
+        );
+    }
+
+    #[test]
+    fn parse_dns_servers() {
+        let toml = r#"
+[interface]
+private_key = { smartcard = "auto" }
+dns = ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.interface.dns.len(), 3);
+        assert_eq!(config.interface.dns[0].to_string(), "1.1.1.1");
+        assert_eq!(config.interface.dns[2].to_string(), "2606:4700:4700::1111");
+    }
+
+    #[test]
+    fn parse_dns_default_empty() {
+        let toml = r#"
+[interface]
+private_key = { smartcard = "auto" }
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert!(config.interface.dns.is_empty());
     }
 
     #[test]

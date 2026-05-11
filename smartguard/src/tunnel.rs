@@ -2,20 +2,57 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use iptrie::{Ipv4LCTrieMap, Ipv4Prefix};
+use ipnet::{IpNet, Ipv6Net};
 use rand::{rngs::OsRng, TryRngCore};
 use rustyguard_core::{PeerId, Sessions};
 use rustyguard_crypto::DhOracle;
-use rustyguard_tun::tun::Device as _;
-use rustyguard_tun::{handle_extern, handle_intern, tun, AlignedPacket, Write, TUN_BUF_START};
-
+use rustyguard_tun::{
+    tun::{self, Device as _},
+    AlignedPacket, Write, TUN_BUF_START,
+};
+use smartguard_crypto::{handle_extern, handle_intern, PeerNet};
 use tai64::Tai64N;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
 };
 
-use crate::route::{cleanup_routes, setup_routes};
+use crate::dns::{apply_dns, cleanup_dns};
+use crate::route::{cleanup_routes, setup_blackhole, setup_routes, Family};
+
+/// Apply an IPv6 address to the TUN by shelling out to the platform tool.
+/// rustyguard_tun's `Configuration` only handles IPv4 ioctls; IPv6 is set
+/// after the device is up — same shell-out pattern wg-quick uses.
+fn apply_ipv6_addr(tun_name: &str, net: Ipv6Net) -> bool {
+    let cidr = net.to_string();
+    #[cfg(target_os = "macos")]
+    let status = std::process::Command::new("ifconfig")
+        .args([tun_name, "inet6", &cidr, "alias"])
+        .status();
+    #[cfg(target_os = "linux")]
+    let status = std::process::Command::new("ip")
+        .args(["-6", "addr", "add", &cidr, "dev", tun_name])
+        .status();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let status: std::io::Result<std::process::ExitStatus> = {
+        eprintln!("IPv6 address configuration not supported on this platform");
+        Err(std::io::Error::other("unsupported platform"))
+    };
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("TUN address added: {cidr}");
+            true
+        }
+        Ok(s) => {
+            eprintln!("  ifconfig/ip add {cidr} => exit {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("  ifconfig/ip add {cidr} failed: {e}");
+            false
+        }
+    }
+}
 
 /// Run the WireGuard tunnel event loop.
 ///
@@ -30,13 +67,14 @@ use crate::route::{cleanup_routes, setup_routes};
 /// any other tasks.
 pub async fn run_tunnel<O>(
     mut sessions: Sessions<O>,
-    mut peer_net: Ipv4LCTrieMap<PeerId>,
+    mut peer_net: PeerNet,
     peer_ids: &[PeerId],
     listen_port: u16,
-    tun_addr: ipnet::Ipv4Net,
+    tun_addrs: &[IpNet],
     mtu: i32,
-    allowed_ips: &[Ipv4Prefix],
+    allowed_ips: &[IpNet],
     peer_endpoints: &[Option<SocketAddr>],
+    dns_servers: &[IpAddr],
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     O: DhOracle + Send + 'static,
@@ -45,20 +83,53 @@ where
     let endpoint = UdpSocket::bind(bind_addr).await?;
     eprintln!("Listening on UDP {bind_addr}");
 
+    // First IPv4 address (if any) goes through the rustyguard_tun ioctl path.
+    // IPv6 addresses are applied after the device is up via shell-out.
+    let v4_addr = tun_addrs.iter().find_map(|n| match n {
+        IpNet::V4(p) => Some(*p),
+        IpNet::V6(_) => None,
+    });
+
     let mut tun_config = tun::Configuration::default();
-    tun_config
-        .address(tun_addr.addr())
-        .netmask(tun_addr.netmask())
-        .mtu(mtu)
-        .up();
+    if let Some(v4) = v4_addr {
+        tun_config
+            .address(v4.addr())
+            .netmask(v4.netmask())
+            .mtu(mtu)
+            .up();
+    } else {
+        tun_config.mtu(mtu).up();
+    }
 
     let tun_dev = tun::platform::create(&tun_config)?;
     let tun_name = tun_dev.name().to_owned();
     let mut dev = tun::AsyncDevice::new(tun_dev)?;
-    eprintln!("TUN interface {tun_name} up with address {tun_addr}");
+    eprintln!("TUN interface {tun_name} up");
+
+    for net in tun_addrs {
+        if let IpNet::V6(v6) = net {
+            apply_ipv6_addr(&tun_name, *v6);
+        }
+    }
 
     // Set up routes for AllowedIPs.
-    let added_routes = setup_routes(&tun_name, allowed_ips, peer_endpoints);
+    let mut added_routes = setup_routes(&tun_name, allowed_ips, peer_endpoints);
+
+    // Mirror wireguard-apple's implicit kill-switch: any address family the
+    // interface doesn't have an address for gets blackholed. Without this,
+    // unconfigured-family traffic falls back to the system default route
+    // (i.e. leaks to the ISP) just like our IPv6 leak before this change.
+    let has_v4 = tun_addrs.iter().any(|n| matches!(n, IpNet::V4(_)));
+    let has_v6 = tun_addrs.iter().any(|n| matches!(n, IpNet::V6(_)));
+    if !has_v4 {
+        added_routes.extend(setup_blackhole(Family::V4, peer_endpoints));
+    }
+    if !has_v6 {
+        added_routes.extend(setup_blackhole(Family::V6, peer_endpoints));
+    }
+
+    // Replace the system resolver while the tunnel is up (mirrors wg-quick).
+    let applied_dns = apply_dns(&tun_name, dns_servers);
 
     // Initiate handshake to all peers with known endpoints at startup.
     for &peer_id in peer_ids {
@@ -179,8 +250,13 @@ where
         }
     };
 
-    // Clean up routes, then drop the TUN fd (destroys the utun interface)
+    // Restore DNS, then routes, then drop the TUN fd (destroys the utun
+    // interface). DNS first so the State entry isn't orphaned when the
+    // interface name disappears.
     eprintln!("\nShutting down...");
+    if let Some(d) = applied_dns.as_ref() {
+        cleanup_dns(d);
+    }
     cleanup_routes(&added_routes);
     result
 }

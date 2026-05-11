@@ -16,7 +16,6 @@ base64 = "0.22"
 rpassword = "7"
 secrecy = { workspace = true }
 ipnet = "2.9"
-iptrie = "0.10"
 rand = "0.9"
 tai64 = { version = "4.0", features = ["std"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "signal"] }

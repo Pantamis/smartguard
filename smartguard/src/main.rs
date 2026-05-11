@@ -1,4 +1,5 @@
 mod config;
+mod dns;
 mod route;
 mod tunnel;
 
@@ -9,7 +10,7 @@ use std::process;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use iptrie::Ipv4Prefix;
+use ipnet::IpNet;
 
 use config::{Config, PrivateKeyConfig};
 use secrecy::SecretString;
@@ -63,24 +64,27 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_port = config.interface.listen_port.unwrap_or(51820);
     let mtu = config.interface.mtu.unwrap_or(1420);
-    let tun_addr: ipnet::Ipv4Net = config
+    if config.interface.address.is_empty() {
+        return Err("interface.address is required for tunnel mode".into());
+    }
+    let tun_addrs: Vec<IpNet> = config
         .interface
         .address
-        .as_deref()
-        .ok_or("interface.address is required for tunnel mode")?
-        .parse()?;
+        .iter()
+        .map(|s| s.parse())
+        .collect::<Result<_, _>>()?;
 
     // Parse peers into the format needed by build_sessions
     let peers: Vec<(
         PublicKey,
         Option<[u8; 32]>,
         Option<SocketAddr>,
-        Vec<Ipv4Prefix>,
+        Vec<IpNet>,
     )> = config
         .peers
         .iter()
         .map(|p| {
-            let allowed_ips: Vec<Ipv4Prefix> = p
+            let allowed_ips: Vec<IpNet> = p
                 .allowed_ips
                 .iter()
                 .map(|s| s.parse().expect("invalid AllowedIP prefix"))
@@ -94,7 +98,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let all_allowed_ips: Vec<Ipv4Prefix> = peers.iter().flat_map(|p| p.3.clone()).collect();
+    let all_allowed_ips: Vec<IpNet> = peers.iter().flat_map(|p| p.3.clone()).collect();
     let peer_endpoints: Vec<Option<SocketAddr>> = peers.iter().map(|p| p.2).collect();
 
     match &config.interface.private_key {
@@ -118,10 +122,11 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 peer_net,
                 &peer_ids,
                 listen_port,
-                tun_addr,
+                &tun_addrs,
                 mtu,
                 &all_allowed_ips,
                 &peer_endpoints,
+                &config.interface.dns,
             ))?;
         }
         PrivateKeyConfig::Smartcard(ident) => {
@@ -139,10 +144,11 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 peer_net,
                 &peer_ids,
                 listen_port,
-                tun_addr,
+                &tun_addrs,
                 mtu,
                 &all_allowed_ips,
                 &peer_endpoints,
+                &config.interface.dns,
             ))?;
         }
         PrivateKeyConfig::SmartcardAuto => {
@@ -160,10 +166,11 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 peer_net,
                 &peer_ids,
                 listen_port,
-                tun_addr,
+                &tun_addrs,
                 mtu,
                 &all_allowed_ips,
                 &peer_endpoints,
+                &config.interface.dns,
             ))?;
         }
     }
@@ -179,7 +186,7 @@ fn open_smartcard(
         PublicKey,
         Option<[u8; 32]>,
         Option<SocketAddr>,
-        Vec<Ipv4Prefix>,
+        Vec<IpNet>,
     )],
 ) -> Result<CardHandle, Box<dyn std::error::Error>> {
     eprintln!("Opening smartcard {ident}...");
