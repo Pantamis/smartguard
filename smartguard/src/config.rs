@@ -373,10 +373,7 @@ private_key = { smartcard = "auto" }
 address = ["10.0.0.1/24", "fd00::1/64"]
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(
-            config.interface.address,
-            vec!["10.0.0.1/24", "fd00::1/64"]
-        );
+        assert_eq!(config.interface.address, vec!["10.0.0.1/24", "fd00::1/64"]);
     }
 
     #[test]

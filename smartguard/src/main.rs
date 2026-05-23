@@ -75,12 +75,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<_, _>>()?;
 
     // Parse peers into the format needed by build_sessions
-    let peers: Vec<(
-        PublicKey,
-        Option<[u8; 32]>,
-        Option<SocketAddr>,
-        Vec<IpNet>,
-    )> = config
+    let peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)> = config
         .peers
         .iter()
         .map(|p| {
@@ -182,12 +177,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn open_smartcard(
     ident: &str,
     pin: &SecretString,
-    peers: &[(
-        PublicKey,
-        Option<[u8; 32]>,
-        Option<SocketAddr>,
-        Vec<IpNet>,
-    )],
+    peers: &[(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)],
 ) -> Result<CardHandle, Box<dyn std::error::Error>> {
     eprintln!("Opening smartcard {ident}...");
     let card = CardHandle::open(ident, pin)?;

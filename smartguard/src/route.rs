@@ -8,11 +8,15 @@
 //! - **Endpoint bypass** — host routes for each peer endpoint via the
 //!   original outgoing interface, so WireGuard's UDP traffic doesn't loop
 //!   back through the tunnel.
-//! - **Blackhole** — `/1`-half drop routes installed for an address family
-//!   that the interface isn't configured for. Mirrors wireguard-apple's
-//!   implicit kill-switch behavior (it always sets both `ipv4Settings` and
-//!   `ipv6Settings`; an empty family blackholes that family at the OS
-//!   level). For us the same effect comes from the routing table.
+//! - **Unconfigured-family catch-all** — for an address family the TUN has
+//!   no address of, the `/1` halves are still pointed at our utun. Packets
+//!   dead-end (no usable source address on utun for that family), giving
+//!   the same no-leak effect as a hard blackhole but with a softer
+//!   framework-level signal: NEPacketTunnelProvider-based apps (Tailscale
+//!   et al.) can still claim those destinations through their own NEVPN
+//!   tunnel for bootstrap traffic. A literal `-blackhole` would tell
+//!   Network.framework the destination is permanently unreachable and
+//!   break that.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -40,11 +44,17 @@ pub enum AddedRoute {
         tun_name: String,
         family: Family,
     },
-    /// route add -inet[6] -host <ip> (via gateway or interface)
-    Host { ip: String, family: Family },
-    /// Drop route for an unconfigured family — `route -blackhole` on macOS,
-    /// `ip route add blackhole` on Linux.
-    Blackhole { prefix: String, family: Family },
+    /// route add -inet[6] -host <ip> (via gateway or interface).
+    /// `gateway` is the discovered default-route gateway at install time;
+    /// stored so `recheck_routes` can detect a network change (laptop moved
+    /// between Wi-Fi networks, etc.) and replace the stale bypass. `None`
+    /// means the original install used `-interface` (no gateway available
+    /// at the time); we don't track / refresh interface-based bypasses.
+    Host {
+        ip: String,
+        family: Family,
+        gateway: Option<String>,
+    },
     /// Pass-through route for a non-routable prefix that we want to *avoid*
     /// blackholing (e.g. RFC1918, CGNAT). Points at the discovered default
     /// gateway so traffic to these ranges falls through to whatever the
@@ -111,66 +121,6 @@ fn add_net(tun_name: &str, prefix: &str, family: Family) -> Option<AddedRoute> {
     } else {
         None
     }
-}
-
-#[cfg(target_os = "macos")]
-fn add_blackhole(prefix: &str, family: Family) -> Option<AddedRoute> {
-    // BSD route: -blackhole is a flag on the route itself; you still need a
-    // target, so we point at lo0 (the kernel will drop instead of looping).
-    if route_cmd(&[
-        "-n",
-        "add",
-        family.route_flag(),
-        "-net",
-        prefix,
-        "-blackhole",
-        "-interface",
-        "lo0",
-    ]) {
-        eprintln!("Blackhole {family:?}: {prefix}");
-        Some(AddedRoute::Blackhole {
-            prefix: prefix.to_string(),
-            family,
-        })
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn add_blackhole(prefix: &str, family: Family) -> Option<AddedRoute> {
-    // Linux has a first-class blackhole route type — no interface needed.
-    let status = std::process::Command::new("ip")
-        .args(["route", "add", "blackhole", prefix])
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("Blackhole {family:?}: {prefix}");
-            Some(AddedRoute::Blackhole {
-                prefix: prefix.to_string(),
-                family,
-            })
-        }
-        _ => None,
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn add_blackhole(_prefix: &str, _family: Family) -> Option<AddedRoute> {
-    eprintln!("Blackhole routes not supported on this platform");
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn remove_blackhole(prefix: &str, _family: Family) {
-    let _ = std::process::Command::new("ip")
-        .args(["route", "del", "blackhole", prefix])
-        .status();
-}
-
-#[cfg(not(target_os = "linux"))]
-fn remove_blackhole(prefix: &str, family: Family) {
-    let _ = route_cmd(&["-n", "delete", family.route_flag(), "-net", prefix]);
 }
 
 /// Install pass-through routes for the family's blackhole exemption list,
@@ -293,6 +243,12 @@ fn install_endpoint_bypass(
             routes.push(AddedRoute::Host {
                 ip: ip.clone(),
                 family,
+                // Remember the gateway we routed through so a later
+                // `recheck_routes` can compare it against the *current*
+                // default and rebuild the bypass when the laptop moves
+                // between networks. Interface-based bypasses (no
+                // gateway) don't get tracked.
+                gateway: info.gateway.clone(),
             });
         }
     }
@@ -363,50 +319,42 @@ pub fn setup_routes(
     routes
 }
 
-/// Install blackhole `/1` halves for `family`, plus an endpoint bypass for
-/// any peer endpoint of that family — without the bypass we'd cut off our
-/// own WG underlay UDP if the WG endpoint happens to use the blackholed
-/// family. Use when the interface has no address of `family`.
-pub fn setup_blackhole(
+/// For an address family the TUN has no address of, route the family's
+/// `/1` halves *into our utun* rather than installing a hard blackhole.
+///
+/// The packets effectively dead-end: the kernel forwards them to our utun,
+/// fails to pick a usable source address (utun has no global address of
+/// this family, only link-local), and drops them with `EADDRNOTAVAIL`.
+/// Net effect for raw socket users is the same as a blackhole — no leak.
+///
+/// The reason we route to utun instead of hard-blackholing: NEPacketTunnel-
+/// Provider-based apps (Tailscale being the canonical case) use
+/// `NWConnection` / `NWPathMonitor`, which consult both NEVPN provider
+/// claims *and* the kernel routing table. A hard `-blackhole` entry tells
+/// Network.framework "this destination is unreachable" with such finality
+/// that even Tailscale's own NEVPN-managed tunnel can't claim it back —
+/// breaking Tailscale's IPv6 bootstrap. Routing to our utun is a softer
+/// signal: it's just another tunnel claiming the prefix, which NEVPN
+/// providers can override for their own apps' traffic.
+///
+/// We still install endpoint bypass and passthrough routes underneath for
+/// the same reason as before: they're more specific than `/1`, so they
+/// preserve WG-underlay reachability (bypass) and let RFC1918/CGNAT escape
+/// the catch-all (passthrough) when those make sense to keep working.
+pub fn setup_unconfigured_family(
     family: Family,
+    tun_name: &str,
     peer_endpoints: &[Option<SocketAddr>],
 ) -> Vec<AddedRoute> {
-    // Endpoint bypass + exemption passthroughs first — both need the
-    // original routing table to discover gateways before we install the
-    // blackhole halves on top.
     let mut routes = install_endpoint_bypass(peer_endpoints, family);
     routes.extend(install_passthroughs(family));
 
-    // For v6, blackhole the IANA global-unicast allocation (2000::/3) AND
-    // every /3 reserved for *future* global-unicast assignment. None of
-    // these /3s touch link-local (fe80::/10), multicast (ff00::/8), ULA
-    // (fc00::/7), or loopback (::1) — they're all in `f000::/4` or below
-    // — so we get defense-in-depth against future IANA expansions without
-    // re-introducing the "wants to access local network" prompt that
-    // killed the broader `::/1` + `8000::/1` approach.
-    //
-    // Deliberately *not* blackholed: `e000::/4`, `f000::/5`, `f800::/6`,
-    // `0000::/3` — covering these would force explicit pass-throughs for
-    // `fc00::/7` / `fe80::/10` / `ff00::/8` / `::1`, which is what broke
-    // local v6 networking last time we tried.
-    //
-    // For v4 we still split by halves; the equivalent surgical approach
-    // would have to re-enumerate RFC1918 / link-local / multicast / loopback
-    // exceptions. That's only relevant if the interface is v6-only (the
-    // current underlay is v4 UDP, so v4 blackhole is dormant in practice).
-    let prefixes: &[&str] = match family {
+    let halves: &[&str] = match family {
         Family::V4 => &["0.0.0.0/1", "128.0.0.0/1"],
-        Family::V6 => &[
-            "2000::/3", // current global unicast
-            "4000::/3", // reserved for future global unicast (RFC 4291)
-            "6000::/3",
-            "8000::/3",
-            "a000::/3",
-            "c000::/3",
-        ],
+        Family::V6 => &["::/1", "8000::/1"],
     };
-    for prefix in prefixes {
-        if let Some(r) = add_blackhole(prefix, family) {
+    for half in halves {
+        if let Some(r) = add_net(tun_name, half, family) {
             routes.push(r);
         }
     }
@@ -432,13 +380,13 @@ pub fn cleanup_routes(routes: &[AddedRoute]) {
                 ]);
                 eprintln!("Route removed: {prefix}");
             }
-            AddedRoute::Host { ip, family } => {
+            AddedRoute::Host {
+                ip,
+                family,
+                gateway: _,
+            } => {
                 let _ = route_cmd(&["-n", "delete", family.route_flag(), "-host", ip]);
                 eprintln!("Route removed: {ip}");
-            }
-            AddedRoute::Blackhole { prefix, family } => {
-                remove_blackhole(prefix, *family);
-                eprintln!("Blackhole removed: {prefix}");
             }
             AddedRoute::Passthrough { prefix, family } => {
                 let _ = route_cmd(&["-n", "delete", family.route_flag(), "-net", prefix]);
@@ -451,6 +399,79 @@ pub fn cleanup_routes(routes: &[AddedRoute]) {
 struct RouteInfo {
     gateway: Option<String>,
     interface: Option<String>,
+}
+
+/// Current default-route gateway for `family`, or `None` if there isn't one
+/// (no network connectivity, or kernel has only interface-attached defaults).
+/// Asks the kernel via `route -n get -inet[6] default` — that's the literal
+/// default-route entry, not a longest-prefix match, so it returns the *real*
+/// gateway even when our `/1` catch-all routes are in place above it.
+pub fn current_default_gateway(family: Family) -> Option<String> {
+    get_route_info("default", family)?.gateway
+}
+
+/// Re-evaluate every endpoint-bypass `Host` route in `added_routes` against
+/// the current default gateway. If the gateway changed (laptop moved
+/// networks while smartguard was running), delete the stale bypass and
+/// install a fresh one pointing at whatever's now the default. Bypass
+/// routes that were installed without a gateway (interface-mode) are left
+/// alone — we don't know what to compare against.
+///
+/// Two fork/execs of `route` per call (one per family) for the gateway
+/// lookup, plus 0–N more for actual updates. Cheap enough to run on the
+/// runtime thread; called from `run_tunnel`'s select loop.
+pub fn recheck_routes(added_routes: &mut [AddedRoute]) {
+    let v4_current = current_default_gateway(Family::V4);
+    let v6_current = current_default_gateway(Family::V6);
+
+    for r in added_routes.iter_mut() {
+        let AddedRoute::Host {
+            ip,
+            family,
+            gateway: stored,
+        } = r
+        else {
+            continue;
+        };
+        let current = match family {
+            Family::V4 => &v4_current,
+            Family::V6 => &v6_current,
+        };
+        if stored.as_deref() == current.as_deref() {
+            continue;
+        }
+        eprintln!(
+            "Endpoint bypass for {ip}: gateway {:?} → {:?}, updating",
+            stored, current
+        );
+        // Delete the stale bypass first.
+        let _ = route_cmd(&["-n", "delete", family.route_flag(), "-host", ip]);
+        // Install the new one if we have a gateway to point at; otherwise
+        // we just leave the bypass torn down until the next recheck finds
+        // a default route.
+        let installed = match current {
+            Some(gw) => route_cmd(&[
+                "-n",
+                "add",
+                family.route_flag(),
+                "-host",
+                ip,
+                "-gateway",
+                gw,
+            ]),
+            None => {
+                eprintln!(
+                    "  no current {family:?} default; bypass torn down until network returns"
+                );
+                true
+            }
+        };
+        if installed {
+            *stored = current.clone();
+        } else {
+            eprintln!("  failed to install new bypass for {ip}; will retry");
+        }
+    }
 }
 
 /// Use `route -n get -inet[6] <ip>` to find the current gateway and interface

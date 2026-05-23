@@ -145,9 +145,7 @@ fn apply_linux(tun_name: &str, dns_servers: &[IpAddr]) -> bool {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "  resolvconf spawn failed ({e}); install openresolv or systemd-resolved"
-            );
+            eprintln!("  resolvconf spawn failed ({e}); install openresolv or systemd-resolved");
             return false;
         }
     };
