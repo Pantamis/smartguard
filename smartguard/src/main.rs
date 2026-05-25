@@ -14,7 +14,7 @@ use ipnet::IpNet;
 
 use config::{Config, PrivateKeyConfig};
 use secrecy::SecretString;
-use smartguard_crypto::{list_cards, CardHandle, DhOracle};
+use smartguard_crypto::{list_cards, AsyncDhOracle, CardHandle, DhOracle};
 
 use rustyguard_core::{PublicKey, StaticPrivateKey};
 
@@ -93,9 +93,6 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let all_allowed_ips: Vec<IpNet> = peers.iter().flat_map(|p| p.3.clone()).collect();
-    let peer_endpoints: Vec<Option<SocketAddr>> = peers.iter().map(|p| p.2).collect();
-
     match &config.interface.private_key {
         PrivateKeyConfig::Software(key) => {
             eprintln!("Using software private key");
@@ -106,91 +103,85 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             );
             eprintln!("{} peer(s) configured", peers.len());
 
-            let (sessions, peer_net, peer_ids) =
-                smartguard_crypto::build_sessions(private_key, &peers);
-
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(tunnel::run_tunnel(
-                sessions,
-                peer_net,
-                &peer_ids,
+                private_key,
+                peers,
                 listen_port,
                 &tun_addrs,
                 mtu,
-                &all_allowed_ips,
-                &peer_endpoints,
                 &config.interface.dns,
             ))?;
         }
         PrivateKeyConfig::Smartcard(ident) => {
-            let pin = obtain_pin(&config.interface.smartcard.pin_entry)?;
-            let card = open_smartcard(ident, &pin, &peers)?;
-            eprintln!("{} peer(s) configured", peers.len());
-
-            let (sessions, peer_net, peer_ids) = smartguard_crypto::build_sessions(card, &peers);
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(tunnel::run_tunnel(
-                sessions,
-                peer_net,
-                &peer_ids,
+            run_smartcard(
+                ident,
+                &config.interface.smartcard.pin_entry,
+                peers,
                 listen_port,
                 &tun_addrs,
                 mtu,
-                &all_allowed_ips,
-                &peer_endpoints,
                 &config.interface.dns,
-            ))?;
+            )?;
         }
         PrivateKeyConfig::SmartcardAuto => {
-            let pin = obtain_pin(&config.interface.smartcard.pin_entry)?;
-            let card = open_smartcard("auto", &pin, &peers)?;
-            eprintln!("{} peer(s) configured", peers.len());
-
-            let (sessions, peer_net, peer_ids) = smartguard_crypto::build_sessions(card, &peers);
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(tunnel::run_tunnel(
-                sessions,
-                peer_net,
-                &peer_ids,
+            run_smartcard(
+                "auto",
+                &config.interface.smartcard.pin_entry,
+                peers,
                 listen_port,
                 &tun_addrs,
                 mtu,
-                &all_allowed_ips,
-                &peer_endpoints,
                 &config.interface.dns,
-            ))?;
+            )?;
         }
     }
 
     Ok(())
 }
 
-/// Open the smartcard, verify PIN, and prime the ss cache for each peer.
-fn open_smartcard(
+/// Bring up the tunnel using a smartcard-backed key.
+///
+/// The card thread is async-spawned (it awaits a one-shot for the card to
+/// be opened, PIN-verified, and ready), so we set up the tokio runtime
+/// first and drive both setup and the tunnel under the same `block_on`.
+#[allow(clippy::too_many_arguments)]
+fn run_smartcard(
     ident: &str,
-    pin: &SecretString,
-    peers: &[(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)],
-) -> Result<CardHandle, Box<dyn std::error::Error>> {
-    eprintln!("Opening smartcard {ident}...");
-    let card = CardHandle::open(ident, pin)?;
-    eprintln!("Public key: {}", BASE64.encode(card.x25519_pubkey().0));
+    pin_entry: &str,
+    peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
+    listen_port: u16,
+    tun_addrs: &[IpNet],
+    mtu: i32,
+    dns: &[std::net::IpAddr],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pin = obtain_pin(pin_entry)?;
 
-    // Precompute ss for each peer so the card is only called once per peer.
-    for (peer_pk, _, _, _) in peers {
-        if let Err(e) = card.prime_ss(peer_pk) {
-            eprintln!("warning: failed to prime ss for peer: {e}");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async move {
+        eprintln!("Opening smartcard {ident}...");
+        let mut card = CardHandle::open(ident, pin).await?;
+        eprintln!(
+            "Public key: {}",
+            BASE64.encode(card.async_x25519_pubkey().await)
+        );
+
+        // Precompute ss for each peer so handshakes don't pay a card
+        // round-trip for the static-static DH on the hot path.
+        for (peer_pk, _, _, _) in &peers {
+            if let Err(e) = card.prime_ss(peer_pk).await {
+                eprintln!("warning: failed to prime ss for peer: {e}");
+            }
         }
-    }
+        eprintln!("{} peer(s) configured", peers.len());
 
-    Ok(card)
+        tunnel::run_tunnel(card, peers, listen_port, tun_addrs, mtu, dns).await
+    })
 }
 
 fn cmd_down() -> Result<(), Box<dyn std::error::Error>> {

@@ -7,19 +7,19 @@ use std::{
 
 use ipnet::{IpNet, Ipv6Net};
 use rand::{rngs::OsRng, TryRngCore};
-use rustyguard_core::{PeerId, Sessions};
-use rustyguard_crypto::DhOracle;
+use rustyguard_core::PublicKey;
+use rustyguard_crypto::AsyncDhOracle;
 use rustyguard_tun::{
     tun::{self, Device as _},
     AlignedPacket, Write, TUN_BUF_START,
 };
-use smartguard_crypto::{handle_extern, handle_intern, PeerNet};
+use smartguard_crypto::{handle_extern, handle_intern};
 use tai64::Tai64N;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
     task::spawn_blocking,
-    time::{interval, sleep},
+    time::interval,
 };
 
 use crate::dns::{apply_dns, cleanup_dns, AppliedDns};
@@ -83,25 +83,25 @@ fn apply_ipv6_addr(tun_name: &str, net: Ipv6Net) -> bool {
 /// and shuttles packets between the TUN interface and the WireGuard protocol.
 /// Handles SIGINT/SIGTERM for graceful shutdown with route cleanup.
 ///
-/// Sessions calls go through `tokio::task::spawn_blocking` because they may
-/// trigger smartcard DH operations that block for ~tens-to-hundreds of ms.
-/// This tells the tokio runtime "this work is blocking, run it on the
-/// blocking pool" — the async worker stays free to drive the reactor and
-/// any other tasks.
+/// Sessions calls go through the async DH oracle: a smartcard `CardHandle`
+/// awaits the card thread, a `StaticPrivateKey` resolves immediately (via the
+/// `AsyncDhOracle` blanket impl over `DhOracle`). Either way, the runtime
+/// stays free to drive the reactor while DH is in flight — no spawn_blocking
+/// needed for handshakes.
 pub async fn run_tunnel<O>(
-    mut sessions: Sessions<O>,
-    mut peer_net: PeerNet,
-    peer_ids: &[PeerId],
+    oracle: O,
+    peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
     listen_port: u16,
     tun_addrs: &[IpNet],
     mtu: i32,
-    allowed_ips: &[IpNet],
-    peer_endpoints: &[Option<SocketAddr>],
     dns_servers: &[IpAddr],
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    O: DhOracle + Send + 'static,
+    O: AsyncDhOracle + Send + 'static,
 {
+    let (mut sessions, peer_net, peer_ids) =
+        smartguard_crypto::build_sessions(oracle, &peers).await;
+
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
     let endpoint = UdpSocket::bind(bind_addr).await?;
     eprintln!("Listening on UDP {bind_addr}");
@@ -135,6 +135,15 @@ where
         }
     }
 
+    let mut allowed_ips: Vec<IpNet> = Vec::with_capacity(peers.len());
+    let peer_endpoints: Vec<SocketAddr> = peers
+        .into_iter()
+        .flat_map(|p| {
+            allowed_ips.extend(p.3);
+            p.2
+        })
+        .collect();
+
     // Deliberately *not* assigning a placeholder ULA when no v6 address is
     // configured: doing so would make NWPathMonitor report utun5 as a
     // usable v6 path. NEPacketTunnelProvider-based apps (Tailscale, etc.)
@@ -153,7 +162,7 @@ where
     // accessible to a CLI.
 
     let mut guard = CleanupGuard {
-        added_routes: setup_routes(&tun_name, allowed_ips, peer_endpoints),
+        added_routes: setup_routes(&tun_name, &allowed_ips, &peer_endpoints),
         applied_dns: None,
     };
 
@@ -167,33 +176,28 @@ where
     let has_v4 = tun_addrs.iter().any(|n| matches!(n, IpNet::V4(_)));
     let has_v6 = tun_addrs.iter().any(|n| matches!(n, IpNet::V6(_)));
     if !has_v4 {
-        guard
-            .added_routes
-            .extend(setup_unconfigured_family(Family::V4, &tun_name, peer_endpoints));
+        guard.added_routes.extend(setup_unconfigured_family(
+            Family::V4,
+            &tun_name,
+            &peer_endpoints,
+        ));
     }
     if !has_v6 {
-        guard
-            .added_routes
-            .extend(setup_unconfigured_family(Family::V6, &tun_name, peer_endpoints));
+        guard.added_routes.extend(setup_unconfigured_family(
+            Family::V6,
+            &tun_name,
+            &peer_endpoints,
+        ));
     }
 
     // Replace the system resolver while the tunnel is up (mirrors wg-quick).
     guard.applied_dns = apply_dns(&tun_name, dns_servers);
 
     // Initiate handshake to all peers with known endpoints at startup.
-    for &peer_id in peer_ids {
-        let init;
-        (sessions, init) = spawn_blocking(move || {
-            let mut dummy = [0u8; 16];
-            let init = match sessions.send_message(peer_id, &mut dummy) {
-                Ok(rustyguard_core::SendMessage::Maintenance(msg)) => Some(msg),
-                _ => None,
-            };
-
-            (sessions, init)
-        })
-        .await?;
-        if let Some(msg) = init {
+    for &peer_id in &peer_ids {
+        if let Ok(rustyguard_core::SendMessage::Maintenance(msg)) =
+            sessions.async_send_message(peer_id, &mut [0u8; 16]).await
+        {
             let addr = msg.to();
             eprintln!("Initiating handshake to {addr}");
             if let Err(e) = endpoint.send_to(msg.data(), addr).await {
@@ -221,24 +225,19 @@ where
     let mut endpoint_buffer = Box::new(AlignedPacket([0; 2048]));
     let mut tun_buffer = vec![0u8; 2048];
 
-    let result: Result<(), Box<dyn std::error::Error>> = 'main: loop {
+    let result: Result<(), Box<dyn std::error::Error>> = loop {
         let mut ep_buf = ReadBuf::new(&mut endpoint_buffer.0);
         let mut tun_reply_buf = ReadBuf::new(&mut tun_buffer[TUN_BUF_START..]);
         tokio::select! {
             _ = sigint.recv() => break Ok(()),
             _ = sigterm.recv() => break Ok(()),
             _ = tick.tick() => {
-                // turn blocks on the smart card for a handshake
-                // every 2 minutes, although spawn_blocking has a cost
-                // it is negligible once every second compared to
-                // blocking the runtime 100 ms every 2 minutes
-                (sessions, maintenance_buffer) = spawn_blocking(move || {
-                    while let Some(msg) = sessions.turn(Tai64N::now(), &mut OsRng.unwrap_err()) {
-                        maintenance_buffer.push(msg);
-                    }
-                    (sessions, maintenance_buffer)
-                })
-                .await?;
+                // `async_turn` drives any rekey handshakes due now; with
+                // a smartcard oracle each one awaits the card thread, with
+                // a software key it returns immediately.
+                while let Some(msg) = sessions.turn(Tai64N::now(), &mut OsRng.unwrap_err()).await {
+                    maintenance_buffer.push(msg);
+                }
 
                 if matches!(guard.added_routes[host_route_idx], AddedRoute::Host { gateway: None, ..}) {
                     guard = spawn_blocking(move || {
@@ -254,67 +253,30 @@ where
                 }
             },
             res = endpoint.recv_buf_from(&mut ep_buf) => {
-                let (n, addr) = res?;
+                let (_, addr) = res?;
 
                 let ep_buf = ep_buf.filled_mut();
-                // Fast path: avoid spawn_blocking if we are in case
-                // where no handshake will be performed
-                const MSG_FIRST: u8 = 1;
-                if n > 0 && (ep_buf[0] != MSG_FIRST) {
-                    if let Write::Inbound(data) = handle_extern(
-                        &mut sessions,
-                        &peer_net,
-                        addr,
-                        ep_buf,
-                    ) {
+                match handle_extern(&mut sessions, &peer_net, addr, ep_buf).await {
+                    Write::Inbound(data) => {
                         dev.write_all(data).await?;
                     }
-
-                    // recv_message for MSG_DATA only ever produces
-                    // Read (→ Inbound), Noop, or Err — it never
-                    // generates a reply.
-                    continue 'main;
-                }
-
-                let msg_len;
-                (sessions, peer_net, endpoint_buffer, msg_len) = spawn_blocking(move || {
-                    let msg_len = if let Write::Outbound(data, _) = handle_extern(
-                        &mut sessions,
-                        &peer_net,
-                        addr,
-                        &mut endpoint_buffer.0[..n],
-                    )
-                    {
-                        data.len()
-                    } else {
-                        // Invalid message received continue
-                        0
-                    };
-
-                    (sessions, peer_net, endpoint_buffer, msg_len)
-                })
-                .await?;
-                if msg_len == 0 {
-                    continue 'main
-                }
-                // If here we performed a handshake
-                if let Err(e) = endpoint.send_to(&endpoint_buffer.0[..msg_len], addr).await {
-                    eprintln!("send_to {addr} failed: {e}");
-                    guard = spawn_blocking(move || {
-                        recheck_routes(&mut guard.added_routes);
-                        guard
-                    }).await?;
+                    Write::Outbound(data, _) => {
+                        // Handshake reply produced by the responder path.
+                        if let Err(e) = endpoint.send_to(&data[..data.len()], addr).await {
+                            eprintln!("send_to {addr} failed: {e}");
+                            guard = spawn_blocking(move || {
+                                recheck_routes(&mut guard.added_routes);
+                                guard
+                            }).await?;
+                        }
+                    }
+                    Write::None => {}
                 }
             }
             res = dev.read_buf(&mut tun_reply_buf) => {
-                // Not spawn on the blocking pool as this can triggers
-                // a smart card handshake only when there's no active
-                // session, `tick_timers` runs every second and pushes
-                // `RekeyAttempt` ~60s before the session window closes
-                // (REKEY_AFTER_TIME = 120s vs. REJECT_AFTER_TIME = 180s),
-                // so a packet-driven cold handshake here is a corner case.
+                let filled = TUN_BUF_START + res?;
                 if let Write::Outbound(data, dst) =
-                    handle_intern(&mut sessions, &peer_net, &mut tun_buffer, TUN_BUF_START + res?)
+                    handle_intern(&mut sessions, &peer_net, &mut tun_buffer, filled).await
                 {
                     if let Err(e) = endpoint.send_to(data, dst).await {
                         eprintln!("send_to {dst} failed: {e}");
@@ -323,10 +285,9 @@ where
                             guard
                         }).await?;
                     }
-                };
+                }
                 // handle_intern never produces Inbound (it always
                 // wraps a TUN-read packet for outbound transmission).
-                // Or produce None so no-op in else case.
             }
         }
     };

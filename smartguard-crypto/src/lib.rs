@@ -10,6 +10,7 @@
 
 mod card;
 pub mod session;
+mod thread;
 
 use std::net::SocketAddr;
 
@@ -20,25 +21,25 @@ use rustyguard_crypto::StaticPeerConfig;
 
 pub use card::{CardHandle, CardInfo, SmartcardError, list_cards};
 pub use rustyguard_crypto::{
-    CryptoCore, CryptoError, CryptoPrimatives, DhOracle, EphemeralPrivateKey, Key, Mac, PublicKey,
-    StaticPrivateKey,
+    AsyncDhOracle, CryptoCore, CryptoError, CryptoPrimatives, DhOracle, EphemeralPrivateKey, Key,
+    Mac, PublicKey, StaticPrivateKey,
 };
 pub use session::{PeerNet, PeerNetBuilder, handle_extern, handle_intern};
 
 /// Build a WireGuard session manager and dual-stack AllowedIPs routing table.
 ///
 /// `oracle` owns our static private key — pass a `StaticPrivateKey` by value
-/// for software mode or a `CardHandle` by value for smartcard mode (both
-/// impl `DhOracle`). The oracle is moved into `Sessions` so it lives for as
-/// long as the tunnel.
+/// for software mode (auto-lifted to `AsyncDhOracle` by the blanket impl) or
+/// a `CardHandle` by value for smartcard mode. The oracle is moved into
+/// `Sessions` so it lives for as long as the tunnel.
 ///
 /// AllowedIPs accept mixed v4/v6 prefixes; the returned [`PeerNet`] dispatches
 /// internally based on address family.
-pub fn build_sessions<O: DhOracle>(
+pub async fn build_sessions<O: AsyncDhOracle>(
     oracle: O,
     peers: &[(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)],
 ) -> (Sessions<O>, PeerNet, Vec<PeerId>) {
-    let mut config = Config::from_oracle(oracle);
+    let mut config = Config::from_oracle_async(oracle).await;
     let mut peer_ids = Vec::new();
     let mut builder = PeerNetBuilder::new(PeerId::sentinal());
 
