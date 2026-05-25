@@ -192,12 +192,9 @@ fn install_passthroughs(family: Family) -> Vec<AddedRoute> {
 /// Install host-route bypass for each peer endpoint of `family`. Used by
 /// any rule that would otherwise capture the WireGuard underlay UDP itself
 /// (catch-all routes, blackhole routes).
-fn install_endpoint_bypass(
-    peer_endpoints: &[Option<SocketAddr>],
-    family: Family,
-) -> Vec<AddedRoute> {
+fn install_endpoint_bypass(peer_endpoints: &[SocketAddr], family: Family) -> Vec<AddedRoute> {
     let mut routes = Vec::new();
-    for ep in peer_endpoints.iter().flatten() {
+    for ep in peer_endpoints.iter() {
         let ep_family = match ep.ip() {
             IpAddr::V4(_) => Family::V4,
             IpAddr::V6(_) => Family::V6,
@@ -264,7 +261,7 @@ fn install_endpoint_bypass(
 pub fn setup_routes(
     tun_name: &str,
     allowed_ips: &[IpNet],
-    peer_endpoints: &[Option<SocketAddr>],
+    peer_endpoints: &[SocketAddr],
 ) -> Vec<AddedRoute> {
     let mut routes = Vec::new();
 
@@ -344,7 +341,7 @@ pub fn setup_routes(
 pub fn setup_unconfigured_family(
     family: Family,
     tun_name: &str,
-    peer_endpoints: &[Option<SocketAddr>],
+    peer_endpoints: &[SocketAddr],
 ) -> Vec<AddedRoute> {
     let mut routes = install_endpoint_bypass(peer_endpoints, family);
     routes.extend(install_passthroughs(family));

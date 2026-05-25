@@ -7,7 +7,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use rustyguard_core::{DataHeader, Message, SendMessage, Sessions};
-use rustyguard_crypto::DhOracle;
+use rustyguard_crypto::AsyncDhOracle;
 use rustyguard_tun::{
     TUN_BUF_START, Write,
     tun::{Device as _, KERNEL_HEADER_LEN, platform},
@@ -49,13 +49,13 @@ fn ip_dst(buf: &[u8]) -> Option<IpAddr> {
 /// Process a UDP packet just received from the network. Either produces a
 /// reply to send over UDP, an inbound IP packet to write to the TUN, or
 /// nothing (handshake/keepalive/etc).
-pub async fn handle_extern<'a, O: DhOracle>(
+pub async fn handle_extern<'a, O: AsyncDhOracle>(
     sessions: &mut Sessions<O>,
     peer_net: &PeerNet,
     addr: SocketAddr,
     ep_buf: &'a mut [u8],
 ) -> Write<'a> {
-    match sessions.recv_message(addr, ep_buf).await {
+    match sessions.async_recv_message(addr, ep_buf).await {
         Err(e) => println!("error: {e:?}"),
         Ok(Message::Noop) => println!("noop"),
         Ok(Message::HandshakeComplete(_encryptor)) => {
@@ -102,7 +102,7 @@ pub async fn handle_extern<'a, O: DhOracle>(
 
 /// Process an IP packet just read from the TUN. Looks up the destination
 /// peer in `peer_net` and asks Sessions to encrypt/forward.
-pub async fn handle_intern<'a, O: DhOracle>(
+pub async fn handle_intern<'a, O: AsyncDhOracle>(
     sessions: &mut Sessions<O>,
     peer_net: &PeerNet,
     reply_buf: &'a mut [u8], /* TUN buffer */
@@ -118,7 +118,7 @@ pub async fn handle_intern<'a, O: DhOracle>(
     reply_buf[filled..pad_to].fill(0);
 
     match sessions
-        .send_message(peer_idx, &mut reply_buf[IP_PACKET_START..pad_to])
+        .async_send_message(peer_idx, &mut reply_buf[IP_PACKET_START..pad_to])
         .await
         .unwrap()
     {

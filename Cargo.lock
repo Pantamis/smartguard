@@ -553,6 +553,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "oneshot"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe21416a02c693fb9f980befcb230ecc70b0b3d1cc4abf88b9675c4c1457f0c"
+
+[[package]]
 name = "openpgp-card"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -753,7 +759,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-core"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
 dependencies = [
  "foldhash",
  "hashbrown 0.15.5",
@@ -770,7 +776,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-crypto"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
 dependencies = [
  "blake2s_simd",
  "graviola",
@@ -785,7 +791,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-tun"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
 dependencies = [
  "base64ct",
  "futures-core",
@@ -800,7 +806,6 @@ dependencies = [
  "rustyguard-core",
  "rustyguard-crypto",
  "rustyguard-types",
- "rustyguard-utils",
  "tai64",
  "thiserror 2.0.18",
  "tokio",
@@ -809,7 +814,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-types"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
 dependencies = [
  "zerocopy",
  "zeroize",
@@ -818,7 +823,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-utils"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
 dependencies = [
  "foldhash",
  "libm",
@@ -928,6 +933,7 @@ dependencies = [
  "card-backend-pcsc",
  "ipnet",
  "iptrie 0.11.1",
+ "oneshot",
  "openpgp-card",
  "rand",
  "rustyguard-core",
