@@ -13,6 +13,7 @@ pub mod session;
 mod thread;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use ipnet::IpNet;
 use rand::{TryRngCore, rngs::OsRng};
@@ -26,6 +27,14 @@ pub use rustyguard_crypto::{
 };
 pub use session::{PeerNet, PeerNetBuilder, handle_extern, handle_intern};
 
+pub struct PeerConfig {
+    pub public_key: PublicKey,
+    pub preshared_key: Option<[u8; 32]>,
+    pub endpoint: Option<SocketAddr>,
+    pub allowed_ips: Vec<IpNet>,
+    pub persistent_keepalive: Option<Duration>,
+}
+
 /// Build a WireGuard session manager and dual-stack AllowedIPs routing table.
 ///
 /// `oracle` owns our static private key — pass a `StaticPrivateKey` by value
@@ -34,20 +43,25 @@ pub use session::{PeerNet, PeerNetBuilder, handle_extern, handle_intern};
 /// `Sessions` so it lives for as long as the tunnel.
 ///
 /// AllowedIPs accept mixed v4/v6 prefixes; the returned [`PeerNet`] dispatches
-/// internally based on address family.
+/// internally based on address family. The returned `Vec<PeerId>` is aligned
+/// with `peers` (input order preserved), so callers can zip the two.
 pub async fn build_sessions<O: AsyncDhOracle>(
     oracle: O,
-    peers: &[(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)],
+    peers: &[PeerConfig],
 ) -> (Sessions<O>, PeerNet, Vec<PeerId>) {
     let mut config = Config::from_oracle_async(oracle).await;
     let mut peer_ids = Vec::new();
     let mut builder = PeerNetBuilder::new(PeerId::sentinal());
 
-    for (peer_pk, psk, endpoint, allowed_ips) in peers {
-        let id = config.insert_peer(StaticPeerConfig::new(PublicKey(peer_pk.0), *psk, *endpoint));
+    for peer in peers {
+        let id = config.insert_peer(StaticPeerConfig::new(
+            PublicKey(peer.public_key.0),
+            peer.preshared_key,
+            peer.endpoint,
+        ));
         peer_ids.push(id);
 
-        for prefix in allowed_ips {
+        for prefix in &peer.allowed_ips {
             builder.insert(*prefix, id);
         }
     }

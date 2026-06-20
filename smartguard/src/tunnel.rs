@@ -1,25 +1,26 @@
 //! High-level tunnel event loop with signal handling and route management.
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
 use ipnet::{IpNet, Ipv6Net};
 use rand::{rngs::OsRng, TryRngCore};
-use rustyguard_core::PublicKey;
+use rustyguard_core::{DataHeader, PeerId, SendMessage, Sessions};
 use rustyguard_crypto::AsyncDhOracle;
 use rustyguard_tun::{
     tun::{self, Device as _},
     AlignedPacket, Write, TUN_BUF_START,
 };
-use smartguard_crypto::{handle_extern, handle_intern};
+use smartguard_crypto::{handle_extern, handle_intern, PeerConfig};
 use tai64::Tai64N;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
     task::spawn_blocking,
-    time::interval,
+    time::{interval, Instant},
 };
 
 use crate::dns::{apply_dns, cleanup_dns, AppliedDns};
@@ -41,6 +42,21 @@ impl Drop for CleanupGuard {
         }
         cleanup_routes(&self.added_routes);
     }
+}
+
+/// Per-peer runtime state, collected into one `Vec<PeerRuntime>` (one entry
+/// per configured peer) instead of several parallel index-aligned `Vec`s.
+/// The companion `HashMap<SocketAddr, usize>` (see `run_tunnel`) maps a
+/// destination endpoint back to its index in O(1) on the packet hot path.
+struct PeerRuntime {
+    id: PeerId,
+    endpoint: Option<SocketAddr>,
+    /// Persistent-keepalive interval; `None` disables keepalive for this peer.
+    keepalive: Option<Duration>,
+    /// Last time we sent any packet to this peer. Gates persistent keepalive:
+    /// a keepalive is only emitted after `keepalive` of silence, and every
+    /// data packet we send postpones it (WireGuard semantics).
+    last_sent: Instant,
 }
 
 /// Apply an IPv6 address to the TUN by shelling out to the platform tool.
@@ -90,7 +106,7 @@ fn apply_ipv6_addr(tun_name: &str, net: Ipv6Net) -> bool {
 /// needed for handshakes.
 pub async fn run_tunnel<O>(
     oracle: O,
-    peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
+    peers: Vec<PeerConfig>,
     listen_port: u16,
     tun_addrs: &[IpNet],
     mtu: i32,
@@ -135,12 +151,35 @@ where
         }
     }
 
+    // Consolidate per-peer runtime state. `peer_ids` is index-aligned with
+    // `peers` (build_sessions preserves the input order), so we zip them into
+    // one `Vec<PeerRuntime>`. Seed `last_sent` at `now` so the first keepalive
+    // fires `interval` after startup rather than immediately.
+    let now0 = Instant::now();
+    let mut peer_rt: Vec<PeerRuntime> = peer_ids
+        .into_iter()
+        .zip(&peers)
+        .map(|(id, p)| PeerRuntime {
+            id,
+            endpoint: p.endpoint,
+            keepalive: p.persistent_keepalive,
+            last_sent: now0,
+        })
+        .collect();
+    // Reverse index: destination endpoint → peer slot, for O(1) lookup on the
+    // packet hot path (a data send reports the endpoint, not a peer index).
+    let endpoint_to_idx: HashMap<SocketAddr, usize> = peer_rt
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.endpoint.map(|ep| (ep, i)))
+        .collect();
+
     let mut allowed_ips: Vec<IpNet> = Vec::with_capacity(peers.len());
     let peer_endpoints: Vec<SocketAddr> = peers
         .into_iter()
         .flat_map(|p| {
-            allowed_ips.extend(p.3);
-            p.2
+            allowed_ips.extend(p.allowed_ips);
+            p.endpoint
         })
         .collect();
 
@@ -194,9 +233,9 @@ where
     guard.applied_dns = apply_dns(&tun_name, dns_servers);
 
     // Initiate handshake to all peers with known endpoints at startup.
-    for &peer_id in &peer_ids {
+    for p in &peer_rt {
         if let Ok(rustyguard_core::SendMessage::Maintenance(msg)) =
-            sessions.send_message(peer_id, &mut [0u8; 16]).await
+            sessions.send_message(p.id, &mut [0u8; 16]).await
         {
             let addr = msg.to();
             eprintln!("Initiating handshake to {addr}");
@@ -216,7 +255,7 @@ where
     let mut sigint = unix::signal(unix::SignalKind::interrupt())?;
     let mut sigterm = unix::signal(unix::SignalKind::terminate())?;
 
-    let mut maintenance_buffer = Vec::with_capacity(peer_ids.len());
+    let mut maintenance_buffer = Vec::with_capacity(peer_rt.len());
 
     let mut endpoint_buffer = Box::new(AlignedPacket([0; 2048]));
     let mut tun_buffer = vec![0u8; 2048];
@@ -251,6 +290,23 @@ where
                         eprintln!("send_to {} failed: {e}", msg.to());
                     }
                 }
+
+                // `persistent_keepalive`: per-peer proactive empty-payload
+                // data packet that keeps the NAT/firewall mapping open when
+                // there is no organic traffic. `last_sent` is postponed by
+                // any data packet we send to the peer (see the TUN→net path
+                // below), so we only emit a keepalive after `keepalive` of
+                // true silence. If there's no active session yet, send_message
+                // returns a Maintenance handshake init instead — we send that,
+                // recovering the tunnel after e.g. a server restart.
+                let now = Instant::now();
+                for p in peer_rt.iter_mut().filter(|p| {
+                    p.keepalive
+                        .is_some_and(|interval| now.duration_since(p.last_sent) >= interval)
+                }) {
+                    send_keepalive(&mut sessions, p.id, &endpoint).await;
+                    p.last_sent = now;
+                }
             },
             res = endpoint.recv_buf_from(&mut ep_buf) => {
                 let (_, addr) = res?;
@@ -284,6 +340,12 @@ where
                             recheck_routes(&mut guard.added_routes);
                             guard
                         }).await?;
+                    } else if let Some(&i) = endpoint_to_idx.get(&dst) {
+                        // A real packet went to this peer's endpoint — postpone
+                        // its persistent keepalive. Falls through harmlessly if
+                        // the peer has roamed away from its configured endpoint
+                        // (worst case: one redundant keepalive).
+                        peer_rt[i].last_sent = Instant::now();
                     }
                 }
                 // handle_intern never produces Inbound (it always
@@ -294,4 +356,39 @@ where
 
     // Cleanup is handled by `guard`'s Drop
     result
+}
+
+/// Send a keepalive (empty-payload data packet) to `peer_id`. If no active
+/// transport session exists yet, the underlying `async_send_message` returns
+/// a `Maintenance(handshake_init)` instead — we forward that, which kicks
+/// off a fresh handshake. Either case advances the tunnel's liveness.
+async fn send_keepalive<O>(sessions: &mut Sessions<O>, peer_id: PeerId, socket: &UdpSocket)
+where
+    O: AsyncDhOracle + Send,
+{
+    // Wire layout for a keepalive: [DataHeader (16) | payload (0) | tag (16)].
+    const HEADER: usize = std::mem::size_of::<DataHeader>();
+    const TAG: usize = 16;
+    let mut buf = [0u8; HEADER + TAG];
+
+    // Pass a zero-length subslice as the payload slot. encrypt_message
+    // produces a 0-byte ciphertext + 16-byte tag; frame_in_place then writes
+    // the header at [0..HEADER] and the tag at [HEADER..HEADER+TAG].
+    let payload_slot = &mut buf[HEADER..HEADER];
+    match sessions.send_message(peer_id, payload_slot).await {
+        Ok(SendMessage::Data(ep, metadata)) => {
+            metadata.frame_in_place(&mut buf);
+            if let Err(e) = socket.send_to(&buf, ep).await {
+                eprintln!("keepalive to {ep} failed: {e}");
+            }
+        }
+        Ok(SendMessage::Maintenance(msg)) => {
+            if let Err(e) = socket.send_to(msg.data(), msg.to()).await {
+                eprintln!("keepalive handshake to {} failed: {e}", msg.to());
+            }
+        }
+        Err(_) => {
+            // No endpoint configured, or peer rejected — nothing to do.
+        }
+    }
 }
