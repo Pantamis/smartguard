@@ -3,9 +3,9 @@ mod dns;
 mod route;
 mod tunnel;
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -14,7 +14,7 @@ use ipnet::IpNet;
 
 use config::{Config, PrivateKeyConfig};
 use secrecy::SecretString;
-use smartguard_crypto::{list_cards, AsyncDhOracle, CardHandle, DhOracle};
+use smartguard_crypto::{list_cards, AsyncDhOracle, CardHandle, DhOracle, PeerConfig};
 
 use rustyguard_core::{PublicKey, StaticPrivateKey};
 
@@ -74,22 +74,25 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
 
-    // Parse peers into the format needed by build_sessions
-    let peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)> = config
+    // Parse the config peers into the runtime `PeerConfig` (one struct per
+    // peer, carrying everything the session builder and tunnel loop need).
+    // A `persistent_keepalive` of `0` or absent both disable keepalive.
+    let peers: Vec<PeerConfig> = config
         .peers
         .iter()
-        .map(|p| {
-            let allowed_ips: Vec<IpNet> = p
+        .map(|p| PeerConfig {
+            public_key: PublicKey(p.public_key),
+            preshared_key: p.preshared_key,
+            endpoint: p.endpoint,
+            allowed_ips: p
                 .allowed_ips
                 .iter()
                 .map(|s| s.parse().expect("invalid AllowedIP prefix"))
-                .collect();
-            (
-                PublicKey(p.public_key),
-                p.preshared_key,
-                p.endpoint,
-                allowed_ips,
-            )
+                .collect(),
+            persistent_keepalive: match p.persistent_keepalive {
+                Some(0) | None => None,
+                Some(s) => Some(Duration::from_secs(s as u64)),
+            },
         })
         .collect();
 
@@ -151,7 +154,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn run_smartcard(
     ident: &str,
     pin_entry: &str,
-    peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
+    peers: Vec<PeerConfig>,
     listen_port: u16,
     tun_addrs: &[IpNet],
     mtu: i32,
@@ -173,8 +176,8 @@ fn run_smartcard(
 
         // Precompute ss for each peer so handshakes don't pay a card
         // round-trip for the static-static DH on the hot path.
-        for (peer_pk, _, _, _) in &peers {
-            if let Err(e) = card.prime_ss(peer_pk).await {
+        for peer in &peers {
+            if let Err(e) = card.prime_ss(&peer.public_key).await {
                 eprintln!("warning: failed to prime ss for peer: {e}");
             }
         }
