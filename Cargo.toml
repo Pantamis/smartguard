@@ -1,5 +1,5 @@
 [workspace]
-members = ["smartguard-crypto", "smartguard"]
+members = ["smartguard-crypto", "smartguard", "smartguard-mobile"]
 resolver = "2"
 
 [workspace.dependencies]

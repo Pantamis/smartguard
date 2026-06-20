@@ -1,0 +1,16 @@
+[package]
+name = "smartguard-mobile"
+version = "0.1.0"
+edition = "2021"
+
+# `cdylib` is what Android loads (`libsmartguard_mobile.so`); `rlib` lets the
+# crate also build and unit-test on the host toolchain without the NDK.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+smartguard-crypto = { path = "../smartguard-crypto" }
+rustyguard-crypto = { workspace = true }
+jni = "0.21"
+secrecy = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
