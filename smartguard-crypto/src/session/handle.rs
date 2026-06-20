@@ -117,11 +117,14 @@ pub async fn handle_intern<'a, O: AsyncDhOracle>(
     let pad_to = IP_PACKET_START + n.next_multiple_of(16);
     reply_buf[filled..pad_to].fill(0);
 
-    match sessions
+    let send = match sessions
         .send_message(peer_idx, &mut reply_buf[IP_PACKET_START..pad_to])
         .await
-        .unwrap()
     {
+        Ok(send) => send,
+        Err(_) => return Write::None,
+    };
+    match send {
         SendMessage::Maintenance(msg) => {
             let data = msg.data();
             reply_buf[..data.len()].copy_from_slice(data);

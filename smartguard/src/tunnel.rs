@@ -16,7 +16,7 @@ use rustyguard_tun::{
 use smartguard_crypto::{handle_extern, handle_intern};
 use tai64::Tai64N;
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt, ReadBuf},
+    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
     task::spawn_blocking,
     time::interval,
@@ -210,11 +210,7 @@ where
     let host_route_idx = guard
         .added_routes
         .iter()
-        .position(|r| matches!(r, AddedRoute::Host { .. }))
-        .ok_or(io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "Gateway must exist",
-        ))?;
+        .position(|r| matches!(r, AddedRoute::Host { .. }));
 
     use tokio::signal::unix;
     let mut sigint = unix::signal(unix::SignalKind::interrupt())?;
@@ -241,7 +237,9 @@ where
                     maintenance_buffer.push(msg);
                 }
 
-                if matches!(guard.added_routes[host_route_idx], AddedRoute::Host { gateway: None, ..}) {
+                if host_route_idx.is_some_and(|i| {
+                    matches!(guard.added_routes[i], AddedRoute::Host { gateway: None, .. })
+                }) {
                     guard = spawn_blocking(move || {
                         recheck_routes(&mut guard.added_routes);
                         guard
