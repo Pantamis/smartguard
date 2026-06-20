@@ -7,7 +7,7 @@ use std::{
 
 use ipnet::{IpNet, Ipv6Net};
 use rand::{rngs::OsRng, TryRngCore};
-use rustyguard_core::PublicKey;
+use rustyguard_core::{DataHeader, PeerId, PublicKey, SendMessage, Sessions};
 use rustyguard_crypto::AsyncDhOracle;
 use rustyguard_tun::{
     tun::{self, Device as _},
@@ -19,7 +19,7 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
     task::spawn_blocking,
-    time::interval,
+    time::{interval, Instant},
 };
 
 use crate::dns::{apply_dns, cleanup_dns, AppliedDns};
@@ -91,6 +91,7 @@ fn apply_ipv6_addr(tun_name: &str, net: Ipv6Net) -> bool {
 pub async fn run_tunnel<O>(
     oracle: O,
     peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
+    keepalive_intervals: Vec<Option<Duration>>,
     listen_port: u16,
     tun_addrs: &[IpNet],
     mtu: i32,
@@ -99,6 +100,11 @@ pub async fn run_tunnel<O>(
 where
     O: AsyncDhOracle + Send + 'static,
 {
+    assert_eq!(
+        keepalive_intervals.len(),
+        peers.len(),
+        "one keepalive entry per peer"
+    );
     let (mut sessions, peer_net, peer_ids) =
         smartguard_crypto::build_sessions(oracle, &peers).await;
 
@@ -190,11 +196,7 @@ where
         guard.added_routes.extend(setup_unconfigured_family(
             Family::V6,
             &tun_name,
-<<<<<<< HEAD
-            peer_endpoints,
-=======
             &peer_endpoints,
->>>>>>> 34d1813 (feat(async-dh): use asyn dh trait and long live thread model)
         ));
     }
 
@@ -204,7 +206,7 @@ where
     // Initiate handshake to all peers with known endpoints at startup.
     for &peer_id in &peer_ids {
         if let Ok(rustyguard_core::SendMessage::Maintenance(msg)) =
-            sessions.async_send_message(peer_id, &mut [0u8; 16]).await
+            sessions.send_message(peer_id, &mut dummy).await
         {
             let addr = msg.to();
             eprintln!("Initiating handshake to {addr}");
@@ -213,6 +215,11 @@ where
             }
         }
     }
+
+    // Per-peer "last keepalive send" timestamp. Seed at `now` so the first
+    // keepalive fires `interval` seconds after startup (no initial burst).
+    let now0 = Instant::now();
+    let mut last_keepalive: Vec<Instant> = vec![now0; peer_ids.len()];
 
     let mut tick = interval(Duration::from_secs(1));
     let host_route_idx = guard
@@ -259,6 +266,23 @@ where
                         eprintln!("send_to {} failed: {e}", msg.to());
                     }
                 }
+
+                // `persistent_keepalive`: per-peer proactive empty-payload
+                // data packet to keep NAT mappings alive and to age the
+                // session forward so REKEY_AFTER_TIME triggers a fresh
+                // handshake on schedule. If no active session yet, the
+                // call returns a Maintenance handshake init instead — we
+                // send that, which is exactly the recovery behaviour we
+                // want after the server restarts.
+                let now = Instant::now();
+                for (i, &peer_id) in peer_ids.iter().enumerate() {
+                    let Some(interval) = keepalive_intervals[i] else { continue };
+                    if now.duration_since(last_keepalive[i]) < interval {
+                        continue;
+                    }
+                    send_keepalive(&mut sessions, peer_id, &endpoint).await;
+                    last_keepalive[i] = now;
+                }
             },
             res = endpoint.recv_buf_from(&mut ep_buf) => {
                 let (_, addr) = res?;
@@ -302,4 +326,39 @@ where
 
     // Cleanup is handled by `guard`'s Drop
     result
+}
+
+/// Send a keepalive (empty-payload data packet) to `peer_id`. If no active
+/// transport session exists yet, the underlying `async_send_message` returns
+/// a `Maintenance(handshake_init)` instead — we forward that, which kicks
+/// off a fresh handshake. Either case advances the tunnel's liveness.
+async fn send_keepalive<O>(sessions: &mut Sessions<O>, peer_id: PeerId, socket: &UdpSocket)
+where
+    O: AsyncDhOracle + Send,
+{
+    // Wire layout for a keepalive: [DataHeader (16) | payload (0) | tag (16)].
+    const HEADER: usize = std::mem::size_of::<DataHeader>();
+    const TAG: usize = 16;
+    let mut buf = [0u8; HEADER + TAG];
+
+    // Pass a zero-length subslice as the payload slot. encrypt_message
+    // produces a 0-byte ciphertext + 16-byte tag; frame_in_place then writes
+    // the header at [0..HEADER] and the tag at [HEADER..HEADER+TAG].
+    let payload_slot = &mut buf[HEADER..HEADER];
+    match sessions.send_message(peer_id, payload_slot).await {
+        Ok(SendMessage::Data(ep, metadata)) => {
+            metadata.frame_in_place(&mut buf);
+            if let Err(e) = socket.send_to(&buf, ep).await {
+                eprintln!("keepalive to {ep} failed: {e}");
+            }
+        }
+        Ok(SendMessage::Maintenance(msg)) => {
+            if let Err(e) = socket.send_to(msg.data(), msg.to()).await {
+                eprintln!("keepalive handshake to {} failed: {e}", msg.to());
+            }
+        }
+        Err(_) => {
+            // No endpoint configured, or peer rejected — nothing to do.
+        }
+    }
 }

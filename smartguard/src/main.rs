@@ -6,6 +6,7 @@ mod tunnel;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -92,6 +93,16 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect();
+    // Per-peer persistent-keepalive interval. `0` and `None` both disable.
+    // Parallel to `peers` ordering, which build_sessions preserves into peer_ids.
+    let keepalive_intervals: Vec<Option<Duration>> = config
+        .peers
+        .iter()
+        .map(|p| match p.persistent_keepalive {
+            Some(0) | None => None,
+            Some(s) => Some(Duration::from_secs(s as u64)),
+        })
+        .collect();
 
     match &config.interface.private_key {
         PrivateKeyConfig::Software(key) => {
@@ -109,6 +120,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             rt.block_on(tunnel::run_tunnel(
                 private_key,
                 peers,
+                keepalive_intervals,
                 listen_port,
                 &tun_addrs,
                 mtu,
@@ -120,6 +132,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 ident,
                 &config.interface.smartcard.pin_entry,
                 peers,
+                keepalive_intervals,
                 listen_port,
                 &tun_addrs,
                 mtu,
@@ -131,6 +144,7 @@ fn cmd_up(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 "auto",
                 &config.interface.smartcard.pin_entry,
                 peers,
+                keepalive_intervals,
                 listen_port,
                 &tun_addrs,
                 mtu,
@@ -152,6 +166,7 @@ fn run_smartcard(
     ident: &str,
     pin_entry: &str,
     peers: Vec<(PublicKey, Option<[u8; 32]>, Option<SocketAddr>, Vec<IpNet>)>,
+    keepalive_intervals: Vec<Option<Duration>>,
     listen_port: u16,
     tun_addrs: &[IpNet],
     mtu: i32,
@@ -180,7 +195,16 @@ fn run_smartcard(
         }
         eprintln!("{} peer(s) configured", peers.len());
 
-        tunnel::run_tunnel(card, peers, listen_port, tun_addrs, mtu, dns).await
+        tunnel::run_tunnel(
+            card,
+            peers,
+            keepalive_intervals,
+            listen_port,
+            tun_addrs,
+            mtu,
+            dns,
+        )
+        .await
     })
 }
 
