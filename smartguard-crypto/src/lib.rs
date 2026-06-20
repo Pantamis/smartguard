@@ -11,6 +11,7 @@
 mod card;
 pub mod session;
 mod thread;
+pub mod transport;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,6 +22,7 @@ use rustyguard_core::{Config, PeerId, Sessions};
 use rustyguard_crypto::StaticPeerConfig;
 
 pub use card::{CardHandle, CardInfo, SmartcardError, list_cards};
+pub use transport::{ApduBackend, ApduLink, CardBackendBox, CardOpener, pcsc_opener};
 pub use rustyguard_crypto::{
     AsyncDhOracle, CryptoCore, CryptoError, CryptoPrimatives, DhOracle, EphemeralPrivateKey, Key,
     Mac, PublicKey, StaticPrivateKey,

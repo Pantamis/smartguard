@@ -19,6 +19,7 @@ use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::thread::{Request, spawn_card_thread};
+use crate::transport::{CardOpener, pcsc_opener};
 
 /// Information about a connected OpenPGP card with an X25519 decryption key.
 pub struct CardInfo {
@@ -94,11 +95,28 @@ pub struct CardHandle {
 }
 
 impl CardHandle {
-    /// Open a card by identifier (`"auto"` picks the first X25519-capable
-    /// card), verify the PIN, and spawn the worker thread that will serve
-    /// DH requests for the rest of the tunnel's life.
+    /// Open a card over PC/SC by identifier (`"auto"` picks the first
+    /// X25519-capable card), verify the PIN, and spawn the worker thread that
+    /// will serve DH requests for the rest of the tunnel's life.
+    ///
+    /// This is the desktop entry point. On platforms without PC/SC (Android),
+    /// use [`Self::open_with`] and supply a [`CardOpener`] built around the
+    /// platform's APDU link (see [`crate::transport`]).
     pub async fn open(ident: &str, pin: SecretString) -> Result<Self, SmartcardError> {
-        let t = spawn_card_thread(ident.to_owned(), pin).await?;
+        Self::open_with(pcsc_opener(), ident, pin).await
+    }
+
+    /// Like [`Self::open`], but the caller supplies the [`CardOpener`] that
+    /// produces candidate backends. This is the transport-agnostic entry
+    /// point: pass [`pcsc_opener`] for desktop, or an opener that yields an
+    /// [`crate::transport::ApduBackend`] over a CCID-over-USB / JNI link for
+    /// Android.
+    pub async fn open_with(
+        opener: CardOpener,
+        ident: &str,
+        pin: SecretString,
+    ) -> Result<Self, SmartcardError> {
+        let t = spawn_card_thread(opener, ident.to_owned(), pin).await?;
         Ok(Self {
             sender: t.sender,
             ss_cache: HashMap::new(),

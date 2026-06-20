@@ -931,6 +931,7 @@ dependencies = [
 name = "smartguard-crypto"
 version = "0.1.0"
 dependencies = [
+ "card-backend",
  "card-backend-pcsc",
  "ipnet",
  "iptrie 0.11.1",

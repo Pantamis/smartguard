@@ -8,6 +8,7 @@ rustyguard-core = { workspace = true }
 rustyguard-crypto = { workspace = true }
 rustyguard-tun = { workspace = true }
 openpgp-card = { workspace = true }
+card-backend = { workspace = true }
 card-backend-pcsc = { workspace = true }
 subtle = { workspace = true }
 secrecy = { workspace = true }
