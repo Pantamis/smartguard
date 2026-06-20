@@ -759,7 +759,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-core"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
 dependencies = [
  "foldhash",
  "hashbrown 0.15.5",
@@ -776,7 +776,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-crypto"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
 dependencies = [
  "blake2s_simd",
  "graviola",
@@ -791,7 +791,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-tun"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
 dependencies = [
  "base64ct",
  "futures-core",
@@ -806,6 +806,7 @@ dependencies = [
  "rustyguard-core",
  "rustyguard-crypto",
  "rustyguard-types",
+ "rustyguard-utils",
  "tai64",
  "thiserror 2.0.18",
  "tokio",
@@ -814,7 +815,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-types"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
 dependencies = [
  "zerocopy",
  "zeroize",
@@ -823,7 +824,7 @@ dependencies = [
 [[package]]
 name = "rustyguard-utils"
 version = "0.1.0"
-source = "git+https://github.com/Pantamis/rustyguard.git?branch=async_dh_trait#39748c36902ad0b996f5d27043ef51f4a7b6f1ab"
+source = "git+https://github.com/Pantamis/rustyguard.git?branch=dh_oracle_trait#fa0b99454d157c1e0fe3793b148d0ad157c71a83"
 dependencies = [
  "foldhash",
  "libm",

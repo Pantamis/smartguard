@@ -3,11 +3,11 @@ members = ["smartguard-crypto", "smartguard"]
 resolver = "2"
 
 [workspace.dependencies]
-rustyguard-crypto = { git = "https://github.com/Pantamis/rustyguard.git", branch = "async_dh_trait" }
-rustyguard-core = { git = "https://github.com/Pantamis/rustyguard.git", branch = "async_dh_trait" }
-rustyguard-types = { git = "https://github.com/Pantamis/rustyguard.git", branch = "async_dh_trait" }
-rustyguard-utils = { git = "https://github.com/Pantamis/rustyguard.git", branch = "async_dh_trait" }
-rustyguard-tun = { git = "https://github.com/Pantamis/rustyguard.git", branch = "async_dh_trait" }
+rustyguard-crypto = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-core = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-types = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-utils = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
+rustyguard-tun = { git = "https://github.com/Pantamis/rustyguard.git", branch = "dh_oracle_trait" }
 
 # Smartcard
 openpgp-card = "0.6.1"

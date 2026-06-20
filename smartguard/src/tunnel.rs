@@ -196,7 +196,7 @@ where
     // Initiate handshake to all peers with known endpoints at startup.
     for &peer_id in &peer_ids {
         if let Ok(rustyguard_core::SendMessage::Maintenance(msg)) =
-            sessions.async_send_message(peer_id, &mut [0u8; 16]).await
+            sessions.send_message(peer_id, &mut [0u8; 16]).await
         {
             let addr = msg.to();
             eprintln!("Initiating handshake to {addr}");
@@ -232,9 +232,11 @@ where
             _ = sigint.recv() => break Ok(()),
             _ = sigterm.recv() => break Ok(()),
             _ = tick.tick() => {
-                // `async_turn` drives any rekey handshakes due now; with
-                // a smartcard oracle each one awaits the card thread, with
-                // a software key it returns immediately.
+                // turn blocks on the smart card for a handshake
+                // every 2 minutes, although spawn_blocking has a cost
+                // it is negligible once every second compared to
+                // blocking the runtime 100 ms every 2 minutes
+
                 while let Some(msg) = sessions.turn(Tai64N::now(), &mut OsRng.unwrap_err()).await {
                     maintenance_buffer.push(msg);
                 }

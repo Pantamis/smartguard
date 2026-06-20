@@ -55,7 +55,7 @@ pub async fn handle_extern<'a, O: AsyncDhOracle>(
     addr: SocketAddr,
     ep_buf: &'a mut [u8],
 ) -> Write<'a> {
-    match sessions.async_recv_message(addr, ep_buf).await {
+    match sessions.recv_message(addr, ep_buf).await {
         Err(e) => println!("error: {e:?}"),
         Ok(Message::Noop) => println!("noop"),
         Ok(Message::HandshakeComplete(_encryptor)) => {
@@ -118,7 +118,7 @@ pub async fn handle_intern<'a, O: AsyncDhOracle>(
     reply_buf[filled..pad_to].fill(0);
 
     match sessions
-        .async_send_message(peer_idx, &mut reply_buf[IP_PACKET_START..pad_to])
+        .send_message(peer_idx, &mut reply_buf[IP_PACKET_START..pad_to])
         .await
         .unwrap()
     {
