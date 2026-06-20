@@ -167,14 +167,18 @@ where
     let has_v4 = tun_addrs.iter().any(|n| matches!(n, IpNet::V4(_)));
     let has_v6 = tun_addrs.iter().any(|n| matches!(n, IpNet::V6(_)));
     if !has_v4 {
-        guard
-            .added_routes
-            .extend(setup_unconfigured_family(Family::V4, &tun_name, peer_endpoints));
+        guard.added_routes.extend(setup_unconfigured_family(
+            Family::V4,
+            &tun_name,
+            peer_endpoints,
+        ));
     }
     if !has_v6 {
-        guard
-            .added_routes
-            .extend(setup_unconfigured_family(Family::V6, &tun_name, peer_endpoints));
+        guard.added_routes.extend(setup_unconfigured_family(
+            Family::V6,
+            &tun_name,
+            peer_endpoints,
+        ));
     }
 
     // Replace the system resolver while the tunnel is up (mirrors wg-quick).
@@ -182,17 +186,10 @@ where
 
     // Initiate handshake to all peers with known endpoints at startup.
     for &peer_id in peer_ids {
-        let init;
-        (sessions, init) = spawn_blocking(move || {
-            let mut dummy = [0u8; 16];
-            let init = match sessions.send_message(peer_id, &mut dummy) {
-                Ok(rustyguard_core::SendMessage::Maintenance(msg)) => Some(msg),
-                _ => None,
-            };
-
-            (sessions, init)
-        })
-        .await?;
+        let init = match sessions.send_message(peer_id, &mut [0u8; 16]).await {
+            Ok(rustyguard_core::SendMessage::Maintenance(msg)) => Some(msg),
+            _ => None,
+        };
         if let Some(msg) = init {
             let addr = msg.to();
             eprintln!("Initiating handshake to {addr}");
@@ -232,13 +229,10 @@ where
                 // every 2 minutes, although spawn_blocking has a cost
                 // it is negligible once every second compared to
                 // blocking the runtime 100 ms every 2 minutes
-                (sessions, maintenance_buffer) = spawn_blocking(move || {
-                    while let Some(msg) = sessions.turn(Tai64N::now(), &mut OsRng.unwrap_err()) {
-                        maintenance_buffer.push(msg);
-                    }
-                    (sessions, maintenance_buffer)
-                })
-                .await?;
+
+                while let Some(msg) = sessions.turn(Tai64N::now(), &mut OsRng.unwrap_err()).await {
+                    maintenance_buffer.push(msg);
+                }
 
                 if matches!(guard.added_routes[host_route_idx], AddedRoute::Host { gateway: None, ..}) {
                     guard = spawn_blocking(move || {
@@ -266,7 +260,7 @@ where
                         &peer_net,
                         addr,
                         ep_buf,
-                    ) {
+                    ).await {
                         dev.write_all(data).await?;
                     }
 
@@ -276,24 +270,18 @@ where
                     continue 'main;
                 }
 
-                let msg_len;
-                (sessions, peer_net, endpoint_buffer, msg_len) = spawn_blocking(move || {
                     let msg_len = if let Write::Outbound(data, _) = handle_extern(
                         &mut sessions,
                         &peer_net,
                         addr,
                         &mut endpoint_buffer.0[..n],
-                    )
+                    ).await
                     {
                         data.len()
                     } else {
                         // Invalid message received continue
                         0
                     };
-
-                    (sessions, peer_net, endpoint_buffer, msg_len)
-                })
-                .await?;
                 if msg_len == 0 {
                     continue 'main
                 }
@@ -314,7 +302,7 @@ where
                 // (REKEY_AFTER_TIME = 120s vs. REJECT_AFTER_TIME = 180s),
                 // so a packet-driven cold handshake here is a corner case.
                 if let Write::Outbound(data, dst) =
-                    handle_intern(&mut sessions, &peer_net, &mut tun_buffer, TUN_BUF_START + res?)
+                    handle_intern(&mut sessions, &peer_net, &mut tun_buffer, TUN_BUF_START + res?).await
                 {
                     if let Err(e) = endpoint.send_to(data, dst).await {
                         eprintln!("send_to {dst} failed: {e}");
