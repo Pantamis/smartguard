@@ -25,7 +25,6 @@
 use card_backend::{
     CardBackend, CardCaps, CardTransaction, PinType, SmartcardError as CardBackendError,
 };
-use card_backend_pcsc::PcscBackend;
 
 use crate::card::SmartcardError;
 
@@ -43,18 +42,6 @@ pub type CardBackendBox = Box<dyn CardBackend + Send + Sync>;
 /// Boxed and `Send` so the transport is chosen at runtime and the opener can
 /// be moved onto the dedicated card thread.
 pub type CardOpener = Box<dyn FnMut() -> Result<Vec<CardBackendBox>, SmartcardError> + Send>;
-
-/// Default desktop opener: enumerate every card reachable over PC/SC.
-///
-/// Individual enumeration errors for a single reader are dropped (that reader
-/// is skipped); only a failure to establish the PC/SC context surfaces.
-pub fn pcsc_opener() -> CardOpener {
-    Box::new(|| {
-        let backends = PcscBackend::card_backends(None)
-            .map_err(|e| SmartcardError::CardError(e.to_string()))?;
-        Ok(backends.filter_map(Result::ok).collect())
-    })
-}
 
 /// The single seam between `openpgp-card` and a physical card link that is not
 /// PC/SC.

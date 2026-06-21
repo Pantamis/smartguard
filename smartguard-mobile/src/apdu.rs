@@ -11,14 +11,22 @@ use std::sync::Arc;
 
 use jni::objects::{JByteArray, JObject, JValue};
 use jni::refs::Global;
-use jni::{Env, JavaVM, jni_sig, jni_str};
+use jni::{jni_sig, jni_str, Env, JavaVM};
 use smartguard_crypto::{ApduBackend, ApduLink, CardBackendBox, CardOpener, SmartcardError};
 
-/// A global reference to the Kotlin transport object, shared (via `Arc`) across
-/// every [`JniApduLink`] the opener produces. `jni::refs::Global` is not
-/// `Clone`, so we share it through an `Arc` rather than holding one ref per
-/// link.
-type SharedTransport = Arc<Global<JObject<'static>>>;
+/// The JVM handle plus a global reference to the Kotlin transport object.
+///
+/// These always travel together — the global ref is only meaningful within
+/// this VM, and both must outlive every link the opener produces — so they
+/// live in one `Arc` (one allocation, one refcount) rather than two. The `Arc`
+/// is also what lets every link share them: `jni::refs::Global` is not `Clone`,
+/// and the underlying JNI global ref is freed once when the last link drops.
+struct Transport {
+    vm: JavaVM,
+    object: Global<JObject<'static>>,
+}
+
+type SharedTransport = Arc<Transport>;
 
 /// An [`ApduLink`] that forwards each command APDU to a Kotlin transport object
 /// across JNI.
@@ -37,14 +45,7 @@ type SharedTransport = Arc<Global<JObject<'static>>>;
 /// `Send + Sync`; the [`Global`] keeps the Kotlin transport object alive across
 /// calls and threads.
 pub struct JniApduLink {
-    vm: Arc<JavaVM>,
     transport: SharedTransport,
-}
-
-impl JniApduLink {
-    pub fn new(vm: Arc<JavaVM>, transport: SharedTransport) -> Self {
-        Self { vm, transport }
-    }
 }
 
 impl ApduLink for JniApduLink {
@@ -53,14 +54,15 @@ impl ApduLink for JniApduLink {
         // (cheap on re-entry) and hands us a scoped `&mut Env`. The closure form
         // is what makes the TLS attachment sound: the `Env` cannot escape the
         // scope, so the attachment state can't outlive its validity.
-        self.vm
+        self.transport
+            .vm
             .attach_current_thread(|env: &mut Env| -> Result<Vec<u8>, jni::errors::Error> {
                 let arg = env.byte_array_from_slice(command)?;
 
                 // Signature and method name are validated and MUTF-8-encoded at
                 // compile time by `jni_sig!` / `jni_str!`.
                 let ret = env.call_method(
-                    self.transport.as_obj(),
+                    self.transport.object.as_obj(),
                     jni_str!("transceive"),
                     jni_sig!("([B)[B"),
                     &[JValue::Object(arg.as_ref())],
@@ -83,9 +85,12 @@ impl ApduLink for JniApduLink {
 /// fresh [`JniApduLink`] each time (the underlying USB connection is
 /// re-established on the Kotlin side when needed). A single connected token
 /// presents one card, so the opener yields exactly one backend.
-pub fn jni_opener(vm: Arc<JavaVM>, transport: SharedTransport) -> CardOpener {
+pub fn jni_opener(vm: JavaVM, object: Global<JObject<'static>>) -> CardOpener {
+    let transport: SharedTransport = Arc::new(Transport { vm, object });
     Box::new(move || {
-        let link = JniApduLink::new(vm.clone(), transport.clone());
+        let link = JniApduLink {
+            transport: transport.clone(),
+        };
         let backend: CardBackendBox = ApduBackend::new(link).into();
         Ok::<Vec<CardBackendBox>, SmartcardError>(vec![backend])
     })

@@ -25,33 +25,52 @@ rustyguard (handshake / sessions)  ── unchanged
 
 | Piece | State |
 |-------|-------|
-| `JniApduLink` — `ApduLink` over a JNI `transceive` callback | ✅ implemented, compiles on host |
+| `JniApduLink` — `ApduLink` over a JNI `transceive` callback | ✅ implemented |
 | `nativeOpenCard` / `nativeCardPublicKey` / `nativeCloseCard` | ✅ implemented |
+| `Card` Kotlin wrapper (`AutoCloseable` + `Cleaner`) | ✅ `kotlin/smartguard/Card.kt` |
+| Builds for Android (`cargo check --target aarch64-linux-android`) | ✅ verified |
+| Data-plane framing (raw IP) + `AsyncFd` TUN | ✅ `framing.rs` / `tun.rs` |
+| `nativeRunTunnel` — scoped VpnService-fd tunnel loop | ✅ compiles (single-peer; untested on device) |
 | CCID-over-USB framing (Kotlin side) | ⛔ TODO |
-| `nativeStartTunnel` — VpnService fd → tunnel loop | ⛔ stub (throws) |
 | `cargo-ndk` packaging / Gradle integration | ⛔ TODO |
 
-The card path is the load-bearing, novel part and is done. The tunnel loop is a
-port of `smartguard/src/tunnel.rs` minus OS route/DNS management (that moves to
-`VpnService.Builder`); see the TODO on `nativeStartTunnel`.
+Everything compiles for `aarch64-linux-android`. `card-backend-pcsc` and
+`rustyguard-tun` are macOS/Linux only, so `smartguard-crypto` gates them out for
+Android (`cfg(not(target_os = "android"))`); the Android card transport and a
+raw-IP data plane live here instead. **Not yet exercised on a device or against
+a real peer** — the protocol/framing is a faithful port of the desktop loop, but
+device testing and the Kotlin USB/VpnService side are still ahead.
 
-## JNI surface — `am.ito.smartguard.SmartguardNative`
+## Kotlin API — use the `Card` wrapper
+
+The handle is a raw Rust pointer behind a `Long`; dereferencing a stale one is
+UB on the native side. So don't call the raw natives directly — use the
+[`Card`](kotlin/smartguard/Card.kt) wrapper, which owns the handle's
+lifetime via `AutoCloseable` (deterministic) plus a `Cleaner` GC backstop for a
+forgotten close:
 
 ```kotlin
-object SmartguardNative {
-    init { System.loadLibrary("smartguard_mobile") }
-
-    // transport: any object exposing `byte[] transceive(byte[] command)`.
-    external fun nativeOpenCard(transport: Any, ident: String, pin: String): Long
-    external fun nativeCardPublicKey(cardHandle: Long): ByteArray?
-    external fun nativeCloseCard(cardHandle: Long)
-    external fun nativeStartTunnel(cardHandle: Long, tunFd: Int): Long  // TODO
-}
+Card.open(transport, ident = "auto", pin = userPin).use { card ->
+    val pubKey: ByteArray = card.publicKey()   // 32-byte X25519 key
+    // ... start the tunnel ...
+}   // handle freed here; card thread stopped
 ```
 
-`ident` is the card id (e.g. `"0006:15422467"`) or `"auto"`. Handles are opaque
-`Long`s (raw pointers) — every `nativeOpenCard` must be paired with exactly one
-`nativeCloseCard`.
+`ident` is the card id (e.g. `"0006:15422467"`) or `"auto"`. `Cleaner` requires
+Android API 33+; on a lower `minSdk`, drop it and rely on `use { }` only.
+
+### Low-level bridge (`private object SmartguardNative`)
+
+The `Card` wrapper sits on top of these 1:1 JNI bindings (in `Card.kt`). They're
+file-private, so `Card` is the only reachable entry point — callers can't bypass
+it. They throw `RuntimeException` on failure and hand out the opaque `Long`:
+
+```kotlin
+external fun nativeOpenCard(transport: Any, ident: String, pin: String): Long
+external fun nativeCardPublicKey(handle: Long): ByteArray
+external fun nativeCloseCard(handle: Long)
+// external fun nativeStartTunnel(handle: Long, tunFd: Int): Long  // TODO
+```
 
 ## The transport contract
 

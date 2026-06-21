@@ -1,8 +1,9 @@
-//! Dual-stack session management: peer-routing table and the message-handling
-//! glue between Sessions, the UDP socket, and the TUN device.
+//! Dual-stack peer-routing table (platform-agnostic).
+//!
+//! The packet-framing glue (`handle_extern`/`handle_intern`) is platform
+//! specific and lives under `desktop/` (macOS/Linux) and in the mobile crate
+//! (Android); only the routing table is shared, so it lives here.
 
-mod handle;
 mod peer_net;
 
-pub use handle::{handle_extern, handle_intern};
 pub use peer_net::{PeerNet, PeerNetBuilder};
