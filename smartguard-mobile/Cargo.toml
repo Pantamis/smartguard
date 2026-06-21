@@ -11,6 +11,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 smartguard-crypto = { path = "../smartguard-crypto" }
 rustyguard-crypto = { workspace = true }
-jni = "0.21"
+jni = "0.22"
 secrecy = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }

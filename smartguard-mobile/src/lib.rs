@@ -10,6 +10,11 @@
 //! object (see [`apdu`]); everything above it (handshake, `ss` cache, async DH
 //! oracle, session management) is shared verbatim with the desktop build.
 //!
+//! Uses the `jni` 0.22 native-method model: each entry takes an FFI-safe
+//! [`EnvUnowned`], upgrades it via [`EnvUnowned::with_env`] (which scopes the
+//! thread attachment and catches panics at the FFI boundary), and resolves the
+//! result with an error policy that throws a Java exception on failure.
+//!
 //! ## JNI surface (class `am.ito.smartguard.SmartguardNative`)
 //!
 //! ```text
@@ -27,13 +32,40 @@ mod apdu;
 
 use std::sync::Arc;
 
-use jni::JNIEnv;
-use jni::objects::{JObject, JString};
-use jni::sys::{jbyteArray, jint, jlong};
+use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::sys::{jint, jlong};
+use jni::{Env, EnvUnowned};
 use secrecy::SecretString;
 use smartguard_crypto::{AsyncDhOracle, CardHandle};
 
 use apdu::jni_opener;
+
+/// Error type for the native methods. `with_env` requires `From<jni::Error>`;
+/// `ThrowRuntimeExAndDefault` requires `std::error::Error`. `Msg` carries our
+/// own (non-JNI) failures — card open, runtime build — into the thrown
+/// `RuntimeException` message.
+#[derive(Debug)]
+enum MobileError {
+    Jni(jni::errors::Error),
+    Msg(String),
+}
+
+impl std::fmt::Display for MobileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MobileError::Jni(e) => write!(f, "{e}"),
+            MobileError::Msg(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for MobileError {}
+
+impl From<jni::errors::Error> for MobileError {
+    fn from(e: jni::errors::Error) -> Self {
+        MobileError::Jni(e)
+    }
+}
 
 /// Opaque handle handed back to Kotlin as a `long`. Owns the tokio runtime that
 /// drives the async card API and the open [`CardHandle`]; dropping it stops the
@@ -44,94 +76,80 @@ struct MobileCard {
 }
 
 /// Open the OpenPGP card over the JNI/USB transport, verify the PIN, and return
-/// an opaque handle (or 0, with a Java exception thrown, on failure).
+/// an opaque handle. On failure a `RuntimeException` is thrown and 0 returned.
 ///
 /// `transport` must expose `byte[] transceive(byte[])`. `ident` is the card
-/// identifier or `"auto"`.
-///
-/// # Safety
-/// JNI calls this with valid arguments; the returned handle must be released
-/// exactly once via [`nativeCloseCard`].
-#[no_mangle]
-pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeOpenCard<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JObject<'local>,
-    transport: JObject<'local>,
-    ident: JString<'local>,
-    pin: JString<'local>,
+/// identifier or `"auto"`. The returned handle must be released exactly once
+/// via [`Java_am_ito_smartguard_SmartguardNative_nativeCloseCard`].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeOpenCard<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    transport: JObject<'caller>,
+    ident: JString<'caller>,
+    pin: JString<'caller>,
 ) -> jlong {
-    let opened = (|| -> Result<jlong, String> {
-        let ident: String = env
-            .get_string(&ident)
-            .map_err(|e| format!("read ident: {e}"))?
-            .into();
-        let pin: String = env
-            .get_string(&pin)
-            .map_err(|e| format!("read pin: {e}"))?
-            .into();
+    unowned
+        .with_env(|env: &mut Env| -> Result<jlong, MobileError> {
+            let ident: String = ident.to_string();
+            let pin: String = pin.to_string();
 
-        let vm = Arc::new(env.get_java_vm().map_err(|e| format!("get_java_vm: {e}"))?);
-        let transport = env
-            .new_global_ref(transport)
-            .map_err(|e| format!("new_global_ref: {e}"))?;
+            let vm = Arc::new(env.get_java_vm()?);
+            let transport = Arc::new(env.new_global_ref(transport)?);
 
-        let opener = jni_opener(vm, transport);
+            let opener = jni_opener(vm, transport);
 
-        // One worker thread is enough: the card thread does the blocking I/O,
-        // the runtime only drives the async oracle plumbing.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| format!("build runtime: {e}"))?;
+            // One worker thread is enough: the card thread does the blocking
+            // I/O, the runtime only drives the async oracle plumbing.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| MobileError::Msg(format!("build runtime: {e}")))?;
 
-        let card = rt
-            .block_on(CardHandle::open_with(opener, &ident, SecretString::from(pin)))
-            .map_err(|e| format!("open card: {e}"))?;
+            let card = rt
+                .block_on(CardHandle::open_with(opener, &ident, SecretString::from(pin)))
+                .map_err(|e| MobileError::Msg(format!("open card: {e}")))?;
 
-        Ok(Box::into_raw(Box::new(MobileCard { rt, card })) as jlong)
-    })();
-
-    match opened {
-        Ok(handle) => handle,
-        Err(msg) => {
-            let _ = env.throw_new("java/lang/RuntimeException", msg);
-            0
-        }
-    }
+            Ok(Box::into_raw(Box::new(MobileCard { rt, card })) as jlong)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-/// Return the card's X25519 public key (32 bytes) as a Java `byte[]`, or `null`
-/// on a bad handle.
-#[no_mangle]
-pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeCardPublicKey<'local>(
-    env: JNIEnv<'local>,
-    _class: JObject<'local>,
+/// Return the card's X25519 public key (32 bytes) as a Java `byte[]`. Throws on
+/// a null/invalid handle.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeCardPublicKey<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
     handle: jlong,
-) -> jbyteArray {
-    if handle == 0 {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: `handle` is a pointer previously returned by `nativeOpenCard` and
-    // not yet closed; Kotlin guarantees single-threaded access to one handle.
-    let mc = unsafe { &mut *(handle as *mut MobileCard) };
+) -> JByteArray<'caller> {
+    unowned
+        .with_env(|env: &mut Env| -> Result<JByteArray, MobileError> {
+            if handle == 0 {
+                return Err(MobileError::Msg("null card handle".to_owned()));
+            }
+            // SAFETY: `handle` is a pointer previously returned by
+            // `nativeOpenCard` and not yet closed; Kotlin guarantees
+            // single-threaded access to one handle.
+            let mc = unsafe { &mut *(handle as *mut MobileCard) };
 
-    let pk = mc.rt.block_on(mc.card.async_x25519_pubkey());
-    match env.byte_array_from_slice(&pk) {
-        Ok(arr) => arr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+            let pk = mc.rt.block_on(mc.card.async_x25519_pubkey());
+            Ok(env.byte_array_from_slice(&pk)?)
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
-/// Close the card and free the handle. Idempotent for `0`.
+/// Close the card and free the handle. Idempotent for `0`. Makes no JNI calls,
+/// so it does not enter `with_env`.
 ///
 /// # Safety
-/// `handle` must be a value returned by [`nativeOpenCard`] that has not already
+/// `handle` must be a value returned by `nativeOpenCard` that has not already
 /// been closed.
-#[no_mangle]
-pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeCloseCard(
-    _env: JNIEnv,
-    _class: JObject,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeCloseCard<'caller>(
+    _unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
     handle: jlong,
 ) {
     if handle != 0 {
@@ -152,16 +170,18 @@ pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeCloseCard(
 ///      so its packets bypass the tunnel).
 ///   3. Reuse `smartguard_crypto::build_sessions` + `handle_intern`/`handle_extern`
 ///      exactly as the desktop loop does, minus the route/DNS management.
-#[no_mangle]
-pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeStartTunnel<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JObject<'local>,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_am_ito_smartguard_SmartguardNative_nativeStartTunnel<'caller>(
+    mut unowned: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
     _card_handle: jlong,
     _tun_fd: jint,
 ) -> jlong {
-    let _ = env.throw_new(
-        "java/lang/UnsupportedOperationException",
-        "nativeStartTunnel: not yet implemented (see TODO in smartguard-mobile)",
-    );
-    0
+    unowned
+        .with_env(|_env: &mut Env| -> Result<jlong, MobileError> {
+            Err(MobileError::Msg(
+                "nativeStartTunnel: not yet implemented (see TODO in smartguard-mobile)".to_owned(),
+            ))
+        })
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }

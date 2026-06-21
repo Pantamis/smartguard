@@ -9,9 +9,16 @@
 
 use std::sync::Arc;
 
-use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JValue};
+use jni::objects::{JByteArray, JObject, JValue};
+use jni::refs::Global;
+use jni::{Env, JavaVM, jni_sig, jni_str};
 use smartguard_crypto::{ApduBackend, ApduLink, CardBackendBox, CardOpener, SmartcardError};
+
+/// A global reference to the Kotlin transport object, shared (via `Arc`) across
+/// every [`JniApduLink`] the opener produces. `jni::refs::Global` is not
+/// `Clone`, so we share it through an `Arc` rather than holding one ref per
+/// link.
+type SharedTransport = Arc<Global<JObject<'static>>>;
 
 /// An [`ApduLink`] that forwards each command APDU to a Kotlin transport object
 /// across JNI.
@@ -26,52 +33,47 @@ use smartguard_crypto::{ApduBackend, ApduLink, CardBackendBox, CardOpener, Smart
 /// returns the response APDU (`data || SW1 SW2`).
 ///
 /// The card is driven from a dedicated *native* OS thread (the card thread in
-/// `smartguard-crypto`) that the JVM does not know about, so every call must
-/// attach the current thread to the JVM before invoking Java. [`JavaVM`] is
-/// `Send + Sync` and cheap to share; [`GlobalRef`] keeps the Kotlin transport
-/// object alive across calls and threads.
-///
-/// TODO(perf): this attaches/detaches the card thread on every call. Since the
-/// card thread is long-lived, switch to `attach_current_thread_permanently`
-/// (attach once on first use) to avoid the per-DH attach overhead.
+/// `smartguard-crypto`) that the JVM does not know about. [`JavaVM`] is
+/// `Send + Sync`; the [`Global`] keeps the Kotlin transport object alive across
+/// calls and threads.
 pub struct JniApduLink {
     vm: Arc<JavaVM>,
-    transport: GlobalRef,
+    transport: SharedTransport,
 }
 
 impl JniApduLink {
-    pub fn new(vm: Arc<JavaVM>, transport: GlobalRef) -> Self {
+    pub fn new(vm: Arc<JavaVM>, transport: SharedTransport) -> Self {
         Self { vm, transport }
     }
 }
 
 impl ApduLink for JniApduLink {
     fn transceive(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
-        // Attach this native thread to the JVM for the duration of the call.
-        let mut env = self
-            .vm
-            .attach_current_thread()
-            .map_err(|e| format!("attach_current_thread: {e}"))?;
+        // `attach_current_thread` permanently attaches this native card thread
+        // (cheap on re-entry) and hands us a scoped `&mut Env`. The closure form
+        // is what makes the TLS attachment sound: the `Env` cannot escape the
+        // scope, so the attachment state can't outlive its validity.
+        self.vm
+            .attach_current_thread(|env: &mut Env| -> Result<Vec<u8>, jni::errors::Error> {
+                let arg = env.byte_array_from_slice(command)?;
 
-        let arg = env
-            .byte_array_from_slice(command)
-            .map_err(|e| format!("byte_array_from_slice: {e}"))?;
+                // Signature and method name are validated and MUTF-8-encoded at
+                // compile time by `jni_sig!` / `jni_str!`.
+                let ret = env.call_method(
+                    self.transport.as_obj(),
+                    jni_str!("transceive"),
+                    jni_sig!("([B)[B"),
+                    &[JValue::Object(arg.as_ref())],
+                )?;
 
-        let ret = env
-            .call_method(
-                self.transport.as_obj(),
-                "transceive",
-                "([B)[B",
-                &[JValue::Object(arg.as_ref())],
-            )
-            .map_err(|e| format!("call transceive(): {e}"))?;
-
-        let obj = ret.l().map_err(|e| format!("transceive return value: {e}"))?;
-        if obj.is_null() {
-            return Err("transceive() returned null".to_owned());
-        }
-        env.convert_byte_array(JByteArray::from(obj))
-            .map_err(|e| format!("convert_byte_array: {e}"))
+                let obj = ret.l()?;
+                if obj.is_null() {
+                    return Err(jni::errors::Error::NullPtr("transceive() returned null"));
+                }
+                let arr = env.cast_local::<JByteArray>(obj)?;
+                env.convert_byte_array(&arr)
+            })
+            .map_err(|e| format!("transceive over JNI: {e}"))
     }
 }
 
@@ -81,7 +83,7 @@ impl ApduLink for JniApduLink {
 /// fresh [`JniApduLink`] each time (the underlying USB connection is
 /// re-established on the Kotlin side when needed). A single connected token
 /// presents one card, so the opener yields exactly one backend.
-pub fn jni_opener(vm: Arc<JavaVM>, transport: GlobalRef) -> CardOpener {
+pub fn jni_opener(vm: Arc<JavaVM>, transport: SharedTransport) -> CardOpener {
     Box::new(move || {
         let link = JniApduLink::new(vm.clone(), transport.clone());
         let backend: CardBackendBox = ApduBackend::new(link).into();
