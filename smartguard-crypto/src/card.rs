@@ -9,53 +9,12 @@
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::{collections::HashMap, future::Future, thread::JoinHandle};
 
-use card_backend_pcsc::PcscBackend;
-use openpgp_card::{
-    Card,
-    ocard::{KeyType::Decryption, crypto::PublicKeyMaterial},
-};
 use rustyguard_crypto::{AsyncDhOracle, CryptoError, Key, PublicKey};
 use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::thread::{Request, spawn_card_thread};
-
-/// Information about a connected OpenPGP card with an X25519 decryption key.
-pub struct CardInfo {
-    pub ident: String,
-    pub public_key: [u8; 32],
-}
-
-/// Enumerate connected OpenPGP cards that expose an X25519 decryption key.
-/// Setup-time helper; no PIN verification, no long-lived state.
-pub fn list_cards() -> Result<Vec<CardInfo>, SmartcardError> {
-    let mut cards = Vec::new();
-    for backend in PcscBackend::cards(None).map_err(|e| SmartcardError::CardError(e.to_string()))? {
-        let Ok(backend) = backend else { continue };
-        let Ok(mut card) = Card::new(backend) else {
-            continue;
-        };
-        let Ok(mut tx) = card.transaction() else {
-            continue;
-        };
-        let Ok(ident) = tx.application_identifier() else {
-            continue;
-        };
-        let ident = ident.ident();
-        let pk = match tx.public_key_material(Decryption) {
-            Ok(PublicKeyMaterial::E(ecc)) => match ecc.data().first_chunk::<32>().copied() {
-                Some(b) => b,
-                None => continue,
-            },
-            _ => continue,
-        };
-        cards.push(CardInfo {
-            ident,
-            public_key: pk,
-        });
-    }
-    Ok(cards)
-}
+use crate::transport::CardOpener;
 
 #[derive(Error, Debug)]
 pub enum SmartcardError {
@@ -94,11 +53,19 @@ pub struct CardHandle {
 }
 
 impl CardHandle {
-    /// Open a card by identifier (`"auto"` picks the first X25519-capable
-    /// card), verify the PIN, and spawn the worker thread that will serve
-    /// DH requests for the rest of the tunnel's life.
-    pub async fn open(ident: &str, pin: SecretString) -> Result<Self, SmartcardError> {
-        let t = spawn_card_thread(ident.to_owned(), pin).await?;
+    /// Open a card from a caller-supplied [`CardOpener`] (the transport-agnostic
+    /// entry point), verify the PIN, and spawn the worker thread that serves DH
+    /// requests for the rest of the tunnel's life.
+    ///
+    /// Desktop builds also get a `CardHandle::open(ident, pin)` convenience over
+    /// PC/SC (see the `desktop` module); Android passes an opener that yields an
+    /// [`crate::transport::ApduBackend`] over a CCID-over-USB / JNI link.
+    pub async fn open_with(
+        opener: CardOpener,
+        ident: &str,
+        pin: SecretString,
+    ) -> Result<Self, SmartcardError> {
+        let t = spawn_card_thread(opener, ident.to_owned(), pin).await?;
         Ok(Self {
             sender: t.sender,
             ss_cache: HashMap::new(),

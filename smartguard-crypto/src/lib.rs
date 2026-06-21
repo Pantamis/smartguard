@@ -9,8 +9,14 @@
 //! the card *is* the oracle.
 
 mod card;
+// All macOS/Linux-only code lives here, gated in one place. Everything else in
+// the crate is platform-agnostic. The Android counterparts are in the
+// `smartguard-mobile` crate.
+#[cfg(not(target_os = "android"))]
+mod desktop;
 pub mod session;
 mod thread;
+pub mod transport;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -20,12 +26,15 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustyguard_core::{Config, PeerId, Sessions};
 use rustyguard_crypto::StaticPeerConfig;
 
-pub use card::{CardHandle, CardInfo, SmartcardError, list_cards};
+pub use card::{CardHandle, SmartcardError};
+pub use transport::{ApduBackend, ApduLink, CardBackendBox, CardOpener};
+#[cfg(not(target_os = "android"))]
+pub use desktop::{CardInfo, handle_extern, handle_intern, list_cards, pcsc_opener};
 pub use rustyguard_crypto::{
     AsyncDhOracle, CryptoCore, CryptoError, CryptoPrimatives, DhOracle, EphemeralPrivateKey, Key,
     Mac, PublicKey, StaticPrivateKey,
 };
-pub use session::{PeerNet, PeerNetBuilder, handle_extern, handle_intern};
+pub use session::{PeerNet, PeerNetBuilder};
 
 pub struct PeerConfig {
     pub public_key: PublicKey,

@@ -1,0 +1,27 @@
+[package]
+name = "smartguard-mobile"
+version = "0.1.0"
+edition = "2021"
+
+# `cdylib` is what Android loads (`libsmartguard_mobile.so`); `rlib` lets the
+# crate also build and unit-test on the host toolchain without the NDK.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+smartguard-crypto = { path = "../smartguard-crypto" }
+rustyguard-crypto = { workspace = true }
+rustyguard-core = { workspace = true }
+jni = "0.22"
+secrecy = { workspace = true }
+# The card *setup* calls (open / public key) only await a one-shot from the card
+# thread (no async I/O on this side), so a minimal `block_on` suffices.
+pollster = "0.4"
+# The *tunnel* (`nativeRunTunnel`) needs a real reactor: a current-thread tokio
+# runtime, scoped to that single blocking call.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+libc = "0.2"
+ipnet = "2"
+base64 = "0.22"
+rand = "0.9"
+tai64 = { version = "4", features = ["std"] }

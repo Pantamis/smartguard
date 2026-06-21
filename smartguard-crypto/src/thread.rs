@@ -9,11 +9,14 @@
 //!
 //! The thread exits cleanly when the request-sender on the [`CardHandle`]
 //! side is dropped (the `recv()` here returns Err and the loop ends).
+//!
+//! The thread is transport-agnostic: it acquires the card through a
+//! [`CardOpener`] (PC/SC on desktop, CCID-over-USB on Android — see
+//! [`crate::transport`]) at startup and again on every reconnect.
 
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-use card_backend_pcsc::PcscBackend;
 use openpgp_card::{
     Card,
     ocard::{
@@ -27,6 +30,7 @@ use secrecy::SecretString;
 use subtle::ConstantTimeEq;
 
 use crate::card::SmartcardError;
+use crate::transport::CardOpener;
 
 /// Cap on in-flight DH requests. Each handshake costs at most 2 card ops
 /// (`ss` + `se`/`es`), and `ss` is cached after the first hit, so 32 covers
@@ -56,6 +60,7 @@ pub(crate) struct CardThread {
 /// PIN, and read out the public key. After that it is ready to serve DH
 /// requests pushed through `sender`.
 pub(crate) async fn spawn_card_thread(
+    opener: CardOpener,
     requested_ident: String,
     pin: SecretString,
 ) -> Result<CardThread, SmartcardError> {
@@ -63,8 +68,8 @@ pub(crate) async fn spawn_card_thread(
     let (ready_tx, ready_rx) = oneshot::channel::<Result<String, SmartcardError>>();
 
     let join = std::thread::Builder::new()
-        .name("smartguard-pcsc".to_owned())
-        .spawn(move || run(requested_ident, pin, req_rx, ready_tx))
+        .name("smartguard-card".to_owned())
+        .spawn(move || run(opener, requested_ident, pin, req_rx, ready_tx))
         .map_err(|e| SmartcardError::CardError(format!("spawn thread: {e}")))?;
 
     let ident = ready_rx
@@ -79,12 +84,13 @@ pub(crate) async fn spawn_card_thread(
 }
 
 fn run(
+    mut opener: CardOpener,
     requested_ident: String,
     pin: SecretString,
     req_rx: Receiver<Request>,
     ready_tx: oneshot::Sender<Result<String, SmartcardError>>,
 ) {
-    let (mut card, ident) = match open_and_verify(&requested_ident, pin.clone()) {
+    let (mut card, ident) = match open_and_verify(&mut opener, &requested_ident, pin.clone()) {
         Ok((card, ident)) => {
             let _ = ready_tx.send(Ok(ident.clone()));
             (card, ident)
@@ -98,7 +104,7 @@ fn run(
     while let Ok(req) = req_rx.recv() {
         match req {
             Request::Dh { peer_pk, reply } => {
-                let result = decipher_with_retry(&mut card, &ident, &pin, &peer_pk);
+                let result = decipher_with_retry(&mut card, &mut opener, &ident, &pin, &peer_pk);
                 // Receiver dropped before getting the answer — caller went away
                 // (e.g. its future was cancelled). Discard, keep serving others.
                 let _ = reply.send(result);
@@ -117,19 +123,21 @@ fn run(
     }
 }
 
-/// Walk the connected PC/SC backends, find one matching `requested_ident`
-/// (or any X25519-capable card when `requested_ident == "auto"`), verify the
-/// User PIN, and return the opened card with its DEC-slot public key.
+/// Walk the candidate backends produced by `opener`, find one matching
+/// `requested_ident` (or any X25519-capable card when `requested_ident ==
+/// "auto"`), verify the User PIN, and return the opened card with its DEC-slot
+/// public key.
 fn open_and_verify(
+    opener: &mut CardOpener,
     requested_ident: &str,
     pin: SecretString,
 ) -> Result<(Card<Open>, String), SmartcardError> {
-    let mut backends =
-        PcscBackend::cards(None).map_err(|e| SmartcardError::CardError(e.to_string()))?;
+    let backends = opener()?;
 
     let (mut card, card_ident) = backends
+        .into_iter()
         .find_map(|backend| {
-            let mut card = Card::new(backend.ok()?).ok()?;
+            let mut card = Card::new(backend).ok()?;
             let mut tx = card.transaction().ok()?;
             let card_ident = tx.application_identifier().ok()?.ident();
             if requested_ident != "auto" && requested_ident != card_ident {
@@ -160,6 +168,7 @@ fn open_and_verify(
 /// `try_decipher`).
 fn decipher_with_retry(
     card: &mut Card<Open>,
+    opener: &mut CardOpener,
     ident: &str,
     pin: &SecretString,
     peer_pk: &[u8; 32],
@@ -169,7 +178,7 @@ fn decipher_with_retry(
         Err(e) => {
             eprintln!("[smartcard] {e}; reconnecting to {ident}...");
             std::thread::sleep(core::time::Duration::from_secs(5));
-            reconnect(card, ident)?;
+            reconnect(card, opener, ident)?;
             try_decipher(card, pin, peer_pk)
         }
     }
@@ -204,9 +213,12 @@ fn try_decipher(
     Ok(key)
 }
 
-fn reconnect(card: &mut Card<Open>, ident: &str) -> Result<(), SmartcardError> {
-    for backend in PcscBackend::cards(None).map_err(|e| SmartcardError::CardError(e.to_string()))? {
-        let Ok(backend) = backend else { continue };
+fn reconnect(
+    card: &mut Card<Open>,
+    opener: &mut CardOpener,
+    ident: &str,
+) -> Result<(), SmartcardError> {
+    for backend in opener()? {
         let Ok(mut new_card) = Card::new(backend) else {
             continue;
         };

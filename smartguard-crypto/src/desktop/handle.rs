@@ -1,8 +1,9 @@
-//! Dual-stack equivalents of `rustyguard_tun::handle_extern` /
-//! `handle_intern`. Same control flow as the v4-only originals, but the
-//! peer-lookup keys are extracted from the IP version nibble (v4 src/dst at
-//! bytes 12–15 / 16–19; v6 at bytes 8–23 / 24–39) instead of going through a
-//! crate-typed v4 packet parser.
+//! Dual-stack TUN packet framing (desktop only).
+//!
+//! `handle_extern` / `handle_intern` shuttle packets between the UDP socket and
+//! the TUN device, using `rustyguard-tun`'s platform framing (the kernel/AF
+//! header offset is macOS/Linux-specific). The Android raw-IP equivalents live
+//! in the `smartguard-mobile` crate.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -13,7 +14,7 @@ use rustyguard_tun::{
     tun::{Device as _, KERNEL_HEADER_LEN, platform},
 };
 
-use super::peer_net::PeerNet;
+use crate::session::PeerNet;
 
 /// Starting position of the IP packet without any header
 const IP_PACKET_START: usize = const_max(std::mem::size_of::<DataHeader>(), KERNEL_HEADER_LEN);
